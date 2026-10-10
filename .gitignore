@@ -258,3 +258,14 @@ documents/*
 # PII (e.g. cv/jane-doe-master-cv.pdf). #1723
 data/intake-state.json
 data/agent-inbox.md
+
+# WeChat bridge agents — runtime state & logs (never commit)
+# wechat-ilink-state.json holds the live bot token for the user's WeChat account
+agent/wechat-ilink-state.json
+agent/wechat-api-state.json
+agent/logs/
+agent/agent.log
+agent/bin/
+
+# Python bytecode cache
+__pycache__/

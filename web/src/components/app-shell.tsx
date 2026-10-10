@@ -21,6 +21,10 @@ import { NAV_ITEMS, isActivePath } from "@/lib/nav-items";
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
+  // The network is a standalone relationship workspace, not a career-ops view.
+  if (pathname === "/network" || pathname.startsWith("/network/")) {
+    return <>{children}</>;
+  }
   return (
     <JobsProvider>
       <PipelineProvider>

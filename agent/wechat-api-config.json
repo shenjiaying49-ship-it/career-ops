@@ -1,0 +1,23 @@
+{
+  "_说明": "微信 Agent 接口配置。把下面的值换成你的真实接口信息，然后运行 wechat-api-agent.mjs",
+  "baseUrl": "http://127.0.0.1:8080",
+  "messagesPath": "/messages",
+  "authHeader": "Authorization",
+  "authToken": "",
+
+  "_增量": "拉新消息的参数：?since_id=xxx（用 state 里记录的游标）",
+  "sinceParam": "since_id",
+
+  "_字段映射": "把右边的字段名改成你的接口实际返回的字段名",
+  "idField": "id",
+  "fromField": "from_name",
+  "contentField": "content",
+  "timeField": "create_time",
+  "isGroupField": "is_group",
+
+  "_行为": "群聊默认不录入；同一联系人 5 分钟内的消息攒成一段再分析",
+  "includeGroups": false,
+  "selfName": "我",
+  "pollMs": 5000,
+  "batchWindowMs": 300000
+}

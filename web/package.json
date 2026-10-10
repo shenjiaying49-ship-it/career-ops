@@ -14,6 +14,7 @@
     "node": ">=22.6.0"
   },
   "dependencies": {
+    "@contak/cli": "^0.2.0",
     "@paper-design/shaders-react": "^0.0.80",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",

@@ -3,12 +3,15 @@
 
 import { deepseekJson } from "@/lib/network/deepseek";
 import { businessContextForPrompt } from "@/lib/network/business-profile";
+import { isSelfName } from "@/lib/network/types";
 
 const SYSTEM_PREAMBLE = `你是一个生态合作 BD 的人脉分析助手。用户会粘贴一段与联系人（客户/合作伙伴）的聊天记录（通常从微信复制，格式可能是"昵称
 时间
 内容"或"昵称: 内容"）。
 
 ${businessContextForPrompt()}
+
+重要：操作者本人是「沈佳颖（Jocelyn/佳颖）」——她是用户自己，绝对不要把她识别为要录入的联系人；如果她在对话里出现，你要分析的是"对方"（另一头的那个人）。
 
 你的任务：分析这段聊天，输出严格的 JSON。
 
@@ -113,6 +116,10 @@ export async function analyzeChat(text: string): Promise<AnalyzeChatResult> {
   const parsed = extractAnalyzeJson(raw);
   if (!parsed?.person?.name) {
     throw new Error("AI 返回的格式无法解析");
+  }
+  // 兜底：AI 把操作者本人识别成了联系人 → 直接拒绝（调用方会丢弃这条）
+  if (isSelfName(parsed.person.name)) {
+    throw new Error("识别到的是操作者本人，已跳过");
   }
   return parsed;
 }

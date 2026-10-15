@@ -5,7 +5,7 @@
 WEB_DIR="/Users/jyshen/claude folder/自我分析与规划/career-ops/web"
 LOG_DIR="/Users/jyshen/claude folder/自我分析与规划/career-ops/agent/logs"
 NODE_BIN="/opt/homebrew/opt/node@22/bin/node"
-export PATH="/opt/homebrew/opt/node@22/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+export PATH="/opt/homebrew/opt/node@22/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 while true; do
   if nc -z 127.0.0.1 3000 2>/dev/null; then

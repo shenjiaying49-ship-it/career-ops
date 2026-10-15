@@ -42,8 +42,10 @@ function notify(title, message) {
   execFile("osascript", ["-e", `display notification "${safe}" with title "${safeTitle}"`], () => {});
 }
 
-// 判断剪贴板文本像不像微信聊天记录：
-// ≥2 行、含中文、且有时间戳或多行「昵称: 内容」格式
+// 判断剪贴板文本像不像微信聊天记录。
+// 放宽策略：≥2 行 + 含中文就先放行，交给 AI 判断——微信 ⌘A 复制的格式多变
+//（有的没时间戳、有的多行消息挤在一起），宁可多分析一次也不漏掉真实聊天。
+// 误入的（随机复制的一段新闻/代码）AI 会返回低置信或没名字，自动丢弃，不入库。
 function chatRejectReason(text) {
   if (!text) return "剪贴板为空";
   if (text.length < 10) return "文本太短（至少 10 个字符）";
@@ -51,9 +53,9 @@ function chatRejectReason(text) {
   const lines = text.split("\n").filter((l) => l.trim());
   if (lines.length < 2) return "只有一行，至少复制两条聊天内容";
   if (!/[\u4e00-\u9fff]/.test(text)) return "未检测到中文聊天内容";
-  const hasTime = /\d{1,2}:\d{2}/.test(text) || /20\d{2}[-/年]/.test(text);
-  const colonLines = (text.match(/^[^\n:：]{1,20}[:：]\s*\S/gm) ?? []).length;
-  if (!hasTime && colonLines < 2) return "没有时间戳或‘昵称：内容’格式";
+  // 明显的代码/URL/JSON 大块直接跳过（省 DeepSeek 调用）
+  const codeish = (text.match(/^(function|const |import |class |def |SELECT |{"|\s*[<>{};]\s*$|https?:\/\/\S+$)/gm) ?? []).length;
+  if (codeish >= 3) return "像代码/链接，不是聊天";
   return "";
 }
 
@@ -85,17 +87,18 @@ async function queueImport(result) {
 
 async function processText(text, { quiet = false } = {}) {
   const name0 = text.split("\n")[0].slice(0, 20);
-  log(`识别到聊天记录（${text.length} 字，首行: ${name0}），分析中…`);
+  log(`识别到疑似聊天记录（${text.length} 字，首行: ${name0}），分析中…`);
   try {
     const result = await analyze(text);
     await queueImport(result);
     const who = [result.person?.name, result.person?.org].filter(Boolean).join(" · ");
     const intent = result.intent?.category ?? "";
     log(`✓ 已入待确认队列：${who}（${intent}）`);
-    if (!quiet) notify("人脉助手已识别", `${who}（${intent}）→ 打开网页一键入库`);
+    if (!quiet) notify("人脉助手已识别", `${who}（${intent}）→ 自动入库开启中，无需操作`);
     return true;
   } catch (err) {
-    log(`✗ 处理失败：${err instanceof Error ? err.message : err}`);
+    // AI 判定不是聊天/没解析出人名 → 静默丢弃（放宽识别后的正常噪音）
+    log(`✗ 未入库（${err instanceof Error ? err.message.slice(0, 80) : err}）`);
     return false;
   }
 }

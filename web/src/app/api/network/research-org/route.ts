@@ -91,7 +91,7 @@ export async function POST(req: Request) {
   // 1. 搜索（失败不阻塞，走模型常识兜底）
   let hits: Awaited<ReturnType<typeof searchWeb>> = [];
   try {
-    hits = await searchWeb(`${name} 组织 AI`, 6);
+    hits = await searchWeb(`${name} AI 组织`, 6);
   } catch { /* 搜索失败 → 兜底 */ }
 
   // 2. 抓取前 2 个结果页（并行、各自尽力而为）

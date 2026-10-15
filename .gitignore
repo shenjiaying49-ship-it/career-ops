@@ -269,3 +269,6 @@ agent/bin/
 
 # Python bytecode cache
 __pycache__/
+
+# Whisper local speech-to-text model (57MB binary, downloaded on demand)
+agent/models/

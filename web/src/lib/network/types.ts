@@ -59,14 +59,49 @@ export type Interaction = {
   nextAction?: string;
 };
 
+// ─── 合作事项（deal）：需要推进到闭环的一件事 ───
+// AI 从聊天/口述里自动提取（"聊了MCN推广，下周发方案"→ 推进中，跟进日期=下周）
+// 状态：推进中 → 达成 / 完结 / 搁置。推进中且过了跟进日期 → 今日行动置顶提醒。
+export type DealStatus = "推进中" | "达成" | "完结" | "搁置";
+
+export type Deal = {
+  id: string;
+  personId: string;
+  title: string;            // 一句话说什么合作（"MCN 推广试点"）
+  status: DealStatus;
+  nextStep?: string;        // 下一步动作（"等我们发方案"）
+  nextFollowUpDate?: string; // 什么时候该推一把
+  createdAt: string;
+  updatedAt: string;
+  closedAt?: string;        // 达成/完结/搁置时间
+  feedback?: string;        // 合作反馈（每行 "日期：内容"）
+  feedbackAt?: string;      // 最近一次反馈时间
+  isFollowUpVisit?: boolean; // 达成后自动生成的回访任务
+};
+
 export type NetworkStore = {
   version: 4;
   people: Person[];
   organizations: Organization[];
   interactions: Interaction[];
+  deals?: Deal[];           // 可选：老数据没有这字段，读到 undefined 就当 []
 };
 
 export const STORAGE_KEY = "career-ops:network-v4";
+
+// ─── 操作者本人：任何情况下不作为人脉录入 ───
+// 转发的聊天里会出现本人（"我"/昵称/英文名），AI 和代码两层都要挡住。
+export const SELF_NAMES = ["沈佳颖", "Jocelyn佳颖", "Jocelyn", "佳颖"];
+
+export function isSelfName(name?: string | null): boolean {
+  const n = (name ?? "").trim().toLowerCase();
+  if (!n || n.length < 2) return false;
+  if (n === "我") return true;
+  return SELF_NAMES.some((s) => {
+    const t = s.toLowerCase();
+    return n === t || n.includes(t) || t.includes(n);
+  });
+}
 
 export const CATEGORIES: ContactCategory[] = [
   "AI builder 社群",
@@ -91,10 +126,10 @@ export const CATEGORY_COLORS: Record<ContactCategory, string> = {
 };
 
 export const STAGE_COLORS: Record<ContactStage, string> = {
-  "潜在": "#94a3b8",
+  "潜在": "#5b6b7a",
   "初步接触": "#60a5fa",
   "深度合作": "#34d399",
-  "暂停": "#d1d5db",
+  "暂停": "#8a95a1",
 };
 
 // ─── 常用标签建议（他是干嘛的）───

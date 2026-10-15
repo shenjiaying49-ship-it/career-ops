@@ -192,6 +192,13 @@ function extractText(msg) {
   for (const it of items) {
     if (it.ref_msg?.title) parts.push(`[引用: ${it.ref_msg.title}]`);
   }
+  // 合并转发的聊天记录等 appmsg：不是 TEXT 类型，但通常带 title/des 字段——尽力提取
+  if (!parts.length) {
+    for (const it of items) {
+      const title = it.title ?? it.appmsg?.title ?? it.des ?? it.appmsg?.des;
+      if (typeof title === "string" && title.trim()) parts.push(`[转发] ${title.trim().slice(0, 400)}`);
+    }
+  }
   return parts.join("\n");
 }
 
@@ -311,16 +318,18 @@ async function runLoop() {
       if (!rememberSeen(mid)) continue;
       if (msg.message_type !== 1) continue;              // 只处理 USER=1 的消息
       if (!msg.from_user_id) continue;
-      if (msg.from_user_id === state.userId) continue;   // 自己发的（若透传）跳过
       userMsgs++;
+      // 自己发出的消息若被镜像（如转发到文件传输助手）→ 也当录入语料，标记来源
+      const isSelf = msg.from_user_id === state.userId;
       if (msg.group_id) { log(`跳过群聊消息（群 ${msg.group_id}）：官方 API 不支持群`); continue; }
       const text = extractText(msg);
       if (!text.trim()) continue;
       try {
-        const d = await forwardToIngest(msg.from_user_id, text);
+        const from = isSelf ? "我的转发" : msg.from_user_id;
+        const d = await forwardToIngest(from, text);
         forwarded++;
-        log(`→ 已转发 ${msg.from_user_id}${d.buffered ? `（攒批第 ${d.buffered} 条）` : "（已触发分析）"}`);
-        notify("人脉桥·微信", `${msg.from_user_id}: ${text.slice(0, 30)}${text.length > 30 ? "…" : ""}`);
+        log(`→ 已转发 ${from}${d.buffered ? `（攒批第 ${d.buffered} 条）` : "（已触发分析）"}`);
+        notify(isSelf ? "人脉桥·我的转发已录入" : "人脉桥·微信", `${from}: ${text.slice(0, 30)}${text.length > 30 ? "…" : ""}`);
       } catch (err) {
         log(`✗ 转发失败：${err.message}（游标暂不推进，下一轮重投）`);
         await sleep(2_000);

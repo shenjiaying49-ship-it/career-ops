@@ -8,8 +8,8 @@ import {
 import { Button } from "@/components/ui/button";
 import {
   CATEGORIES, CATEGORY_COLORS, STAGE_COLORS, TAG_SUGGESTIONS,
-  daysSince, localDatePlus, localToday, DEMO_STORE, STORAGE_KEY,
-  type ContactCategory, type ContactStage, type Interaction, type NetworkStore,
+  daysSince, isSelfName, localDatePlus, localToday, DEMO_STORE, STORAGE_KEY,
+  type ContactCategory, type ContactStage, type Deal, type DealStatus, type Interaction, type NetworkStore,
   type Organization, type Person, type Priority,
 } from "@/lib/network/types";
 
@@ -41,31 +41,50 @@ function generateScript(p: Person, org?: Organization): string {
 
 // ─── 行动引擎 ───
 
-type Urgency = "overdue" | "today" | "soon" | "suggested";
-type ActionItem = { person: Person; urgency: Urgency; reason: string };
+type Urgency = "deal-overdue" | "overdue" | "today" | "soon" | "suggested";
+type ActionItem = { person: Person; urgency: Urgency; reason: string; deal?: Deal; stars: number };
 
 function computeActions(store: NetworkStore): ActionItem[] {
   const items: ActionItem[] = [];
+  const dealOverdue: ActionItem[] = [];
+  // 合作事项到期未闭环 → 最高优先级 push（用户要求：没告诉他完结的，持续提醒跟进）
+  const todayStr = localToday();
+  for (const d of store.deals ?? []) {
+    if (d.status !== "推进中" || !d.nextFollowUpDate) continue;
+    if (d.nextFollowUpDate > todayStr) continue;
+    const person = store.people.find((p) => p.id === d.personId);
+    if (!person) continue;
+    const daysOver = daysSince(d.nextFollowUpDate) ?? 0;
+    dealOverdue.push({
+      person,
+      urgency: "deal-overdue",
+      deal: d,
+      stars: starsOf(person, store),
+      reason: `「${d.title}」该跟进了${d.nextStep ? ` · ${d.nextStep}` : ""}${daysOver > 0 ? `（已过 ${daysOver} 天）` : ""}`,
+    });
+  }
+  items.push(...dealOverdue.sort((a, b) => (a.deal!.nextFollowUpDate! < b.deal!.nextFollowUpDate! ? -1 : 1)));
   for (const p of store.people) {
     if (p.stage === "暂停") continue;
     const until = p.nextFollowUpDate ? daysSince(p.nextFollowUpDate) : null;
     const since = daysSince(p.lastContactDate);
+    const stars = starsOf(p, store);
 
     if (until !== null && until > 0) {
-      items.push({ person: p, urgency: "overdue", reason: `跟进已逾期 ${until} 天` });
+      items.push({ person: p, urgency: "overdue", stars, reason: `跟进已逾期 ${until} 天` });
     } else if (until === 0) {
-      items.push({ person: p, urgency: "today", reason: "今天该联系" });
+      items.push({ person: p, urgency: "today", stars, reason: "今天该联系" });
     } else if (until !== null && until >= -7) {
-      items.push({ person: p, urgency: "soon", reason: `${-until} 天后该联系` });
+      items.push({ person: p, urgency: "soon", stars, reason: `${-until} 天后该联系` });
     } else if (p.stage === "初步接触" && since !== null && since > 10) {
-      items.push({ person: p, urgency: "suggested", reason: `${since} 天没联系了` });
+      items.push({ person: p, urgency: "suggested", stars, reason: `${since} 天没联系了` });
     } else if (p.stage === "深度合作" && since !== null && since > 7) {
-      items.push({ person: p, urgency: "suggested", reason: `深度合作，${since} 天没联系` });
+      items.push({ person: p, urgency: "suggested", stars, reason: `深度合作，${since} 天没联系` });
     } else if (until === null && since === null && p.priority === "high") {
-      items.push({ person: p, urgency: "suggested", reason: "高优先级，还没联系过" });
+      items.push({ person: p, urgency: "suggested", stars, reason: "高优先级，还没联系过" });
     }
   }
-  const order: Record<Urgency, number> = { overdue: 0, today: 1, soon: 2, suggested: 3 };
+  const order: Record<Urgency, number> = { "deal-overdue": 0, overdue: 1, today: 2, soon: 3, suggested: 4 };
   return items.sort((a, b) => order[a.urgency] - order[b.urgency]);
 }
 
@@ -107,7 +126,11 @@ function applyAnalyzeResult(
 ): { next: NetworkStore; person: Person; existingId?: string } {
   const today = localToday();
   const name = (result.person.name ?? "").trim() || "未命名";
-  const existing = store.people.find((x) => x.name === name) ?? null;
+  // 匹配：精确同名 → 互相包含（≥2字，"李总"/"李明远"这类昵称差异也能归到同一人）
+  const existing =
+    store.people.find((x) => x.name === name) ??
+    (name.length >= 2 ? store.people.find((x) => x.name.includes(name) || name.includes(x.name)) : undefined) ??
+    null;
   const orgName = (result.person.org ?? "").trim();
   const org = orgName
     ? store.organizations.find((o) => o.name === orgName || o.name.includes(orgName) || orgName.includes(o.name))
@@ -147,6 +170,8 @@ function applyAnalyzeResult(
       whatTheyWant: existing.whatTheyWant ?? result.person.whatTheyWant ?? undefined,
       cooperation: existing.cooperation ?? result.ourMove?.cooperation ?? undefined,
       aiReply: result.ourMove.suggestedReply,
+      // 新摘要追加进备注（旧值保留，不覆盖）
+      notes: [existing.notes, `自动入库补充 · ${today}：${result.summary}`].filter(Boolean).join("\n\n"),
       stage,
       lastContactDate: today,
       nextFollowUpDate: localDatePlus(today, interval),
@@ -184,6 +209,156 @@ function applyAnalyzeResult(
   };
 }
 
+// ─── 合作事项提取：从聊天/口述里提取进展 → 新建/更新 deals ───
+// fire-and-forget：AI 失败不影响主流程（联系人该入库还是入库）
+
+type ExtractedDeal = {
+  matchId: string | null;
+  title?: string;
+  status: "推进中" | "达成" | "完结" | "搁置";
+  nextStep?: string;
+  followUpDays?: number | null;
+};
+
+function extractDealsInBackground(
+  store: NetworkStore,
+  person: Person,
+  content: string,
+  save: (s: NetworkStore) => void,
+) {
+  if (!content.trim() || content.length < 15) return; // 太短没内容
+  const openDeals = (store.deals ?? [])
+    .filter((d) => d.personId === person.id && d.status === "推进中")
+    .map((d) => ({ id: d.id, title: d.title, nextStep: d.nextStep }));
+  fetch("/api/network/ai-assist", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ kind: "extract-deals", text: content.slice(0, 6000), openDeals }),
+  })
+    .then(async (r) => {
+      const d = await r.json();
+      if (!r.ok) return;
+      const extracted = (d.result?.deals ?? []) as ExtractedDeal[];
+      if (!extracted.length) return;
+      // 拿最新 store（提取期间用户可能存过盘）
+      const raw = localStorage.getItem(STORAGE_KEY);
+      let cur: NetworkStore = store;
+      try { if (raw) cur = JSON.parse(raw) as NetworkStore; } catch { /* 用传入的 */ }
+      const today = localToday();
+      let deals = [...(cur.deals ?? [])];
+      let changed = 0;
+      for (const ex of extracted) {
+        if (ex.matchId) {
+          const idx = deals.findIndex((x) => x.id === ex.matchId && x.personId === person.id);
+          if (idx < 0) continue;
+          const closed = ex.status !== "推进中";
+          deals[idx] = {
+            ...deals[idx],
+            status: ex.status,
+            nextStep: ex.nextStep ?? deals[idx].nextStep,
+            nextFollowUpDate: closed ? undefined : (ex.followUpDays ? localDatePlus(today, ex.followUpDays) : undefined),
+            updatedAt: today,
+            closedAt: closed ? today : deals[idx].closedAt,
+          };
+          changed++;
+        } else if (ex.title?.trim() && ex.status === "推进中") {
+          deals.push({
+            id: `deal-${Date.now()}-${deals.length}`,
+            personId: person.id,
+            title: ex.title.trim().slice(0, 60),
+            status: "推进中",
+            nextStep: ex.nextStep ?? undefined,
+            nextFollowUpDate: ex.followUpDays ? localDatePlus(today, ex.followUpDays) : localDatePlus(today, 7),
+            createdAt: today,
+            updatedAt: today,
+          });
+          changed++;
+        }
+      }
+      if (changed) {
+        save({ ...cur, deals });
+        // 提取函数在组件外，用 DOM 事件广播提示；主组件监听后走自己的 notify
+        window.setTimeout(() => window.dispatchEvent(new CustomEvent("network-toast", { detail: `📋 合作事项已更新（${changed} 项）` })), 2400);
+      }
+    })
+    .catch(() => { /* 提取失败静默 */ });
+}
+
+// ─── 自动标星：按关系深度/优先级/合作/互动频率综合打 1-5 星 ───
+// 纯计算不落盘——数据一变（新合作、新互动、阶段升级）星级自动跟着变。
+function starsOf(p: Person, store: NetworkStore): number {
+  let s = p.stage === "深度合作" ? 3 : p.stage === "初步接触" ? 2 : 1;
+  if (p.priority === "high") s += 1;
+  else if (p.priority === "low") s -= 0.5;
+  const deals = (store.deals ?? []).filter((d) => d.personId === p.id);
+  s += deals.filter((d) => d.status === "达成").length * 0.5;   // 合作达成是最强关系信号
+  s += deals.filter((d) => d.status === "推进中").length * 0.25;
+  const ints = store.interactions.filter((i) => i.personId === p.id).length;
+  if (ints >= 5) s += 0.5;
+  else if (ints >= 2) s += 0.25;
+  if (p.tags.length >= 3) s += 0.25;
+  return Math.max(1, Math.min(5, Math.round(s)));
+}
+
+function Stars({ n, className = "" }: { n: number; className?: string }) {
+  return (
+    <span className={`font-medium tracking-tight text-[#e8a33d] ${className}`} title={`关系星级 ${n}/5（阶段、合作、互动频率自动计算）`}>
+      {"★".repeat(n)}<span className="text-[#e8a33d]/30">{"☆".repeat(5 - n)}</span>
+    </span>
+  );
+}
+
+// ─── 合作反馈弹窗：合作达成/回访后记录效果，回写关系表 ───
+
+function FeedbackModal({
+  deal, personName, onClose, onSubmit,
+}: {
+  deal: Deal;
+  personName: string;
+  onClose: () => void;
+  onSubmit: (text: string) => void;
+}) {
+  const [text, setText] = useState("");
+  const originTitle = (deal.title.match(/「(.+?)」/) ?? [])[1] ?? deal.title;
+  const quick = ["效果很好，对方很满意", "一般，继续观察", "有问题，需要补救", "带来了新机会/转介绍"];
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#0d3b39]/40 p-4 backdrop-blur-sm" onClick={onClose}>
+      <div className="w-full max-w-md rounded-2xl border border-[#0ABAB5]/25 bg-white p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-start justify-between">
+          <div>
+            <h3 className="text-lg font-semibold">记录合作反馈</h3>
+            <p className="mt-0.5 text-xs text-[#0d3b39]/65">{personName} · {originTitle}</p>
+          </div>
+          <Button variant="ghost" size="icon" onClick={onClose} className="text-[#0d3b39]/65 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]">
+            <X className="size-5" />
+          </Button>
+        </div>
+        <div className="mt-3 flex flex-wrap gap-1.5">
+          {quick.map((q) => (
+            <button key={q} onClick={() => setText((t) => (t ? `${t}；${q}` : q))} className="rounded-lg bg-[#0ABAB5]/[0.06] px-2 py-1 text-xs text-[#0d3b39]/85 transition-colors hover:bg-[#0ABAB5]/[0.12]">
+              + {q}
+            </button>
+          ))}
+        </div>
+        <textarea
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          rows={4}
+          autoFocus
+          placeholder="这次合作效果怎么样？对方反馈、实际收获、暴露的问题、带来的新机会…（会写进他的档案和互动记录）"
+          className="mt-3 w-full resize-none rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] px-3 py-2 text-sm leading-6 outline-none placeholder-[#0d3b39]/55 focus:border-[#0ABAB5]/40"
+        />
+        <div className="mt-3 flex gap-2">
+          <Button variant="ghost" size="sm" onClick={onClose} className="flex-1 text-xs text-[#0d3b39]/75 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]">取消</Button>
+          <Button size="sm" disabled={!text.trim()} onClick={() => onSubmit(text.trim())} className="flex-1 border-0 bg-emerald-500/25 text-xs text-emerald-700 hover:bg-emerald-500/40 disabled:opacity-40">
+            保存反馈
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── 主组件 ───
 
 type Tab = "actions" | "people" | "orgs";
@@ -208,6 +383,8 @@ export function NetworkDashboard() {
   const [voiceOpen, setVoiceOpen] = useState(false);
   const [chatInitialText, setChatInitialText] = useState<string | undefined>(undefined);
   const [batchInitialText, setBatchInitialText] = useState<string | undefined>(undefined);
+  // 合作反馈记录弹窗
+  const [feedbackDeal, setFeedbackDeal] = useState<Deal | null>(null);
   const [addOrgPreselect, setAddOrgPreselect] = useState<string | undefined>(undefined);
   // 组织批量检索：AI 补资料
   const [orgBatch, setOrgBatch] = useState<{ done: number; total: number; current: string; found: number } | null>(null);
@@ -256,14 +433,40 @@ export function NetworkDashboard() {
   useEffect(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) setStore(JSON.parse(raw) as NetworkStore);
+      if (raw) {
+        const parsed = JSON.parse(raw) as NetworkStore;
+        // 一次性迁移：清掉误录的操作者本人（连带互动/合作），并切到草稿箱模式
+        const selfIds = new Set(parsed.people.filter((p) => isSelfName(p.name)).map((p) => p.id));
+        if (selfIds.size > 0) {
+          const next: NetworkStore = {
+            ...parsed,
+            people: parsed.people.filter((p) => !selfIds.has(p.id)),
+            interactions: parsed.interactions.filter((i) => !selfIds.has(i.personId)),
+            deals: (parsed.deals ?? []).filter((d) => !selfIds.has(d.personId)),
+          };
+          setStore(next);
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+          fetch("/api/network/backup", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ store: next }),
+          }).catch(() => {});
+        } else {
+          setStore(parsed);
+        }
+      }
     } catch { /* demo fallback */ }
+    // 用户要求回到草稿箱模式：一次性把自动入库关掉（之后可再手动打开）
+    if (!localStorage.getItem("career-ops:network-draft-migration")) {
+      localStorage.setItem("career-ops:network-draft-migration", "1");
+      localStorage.setItem(AUTO_IMPORT_KEY, "0");
+    }
   }, []);
 
-  // ── 智能自动入库：默认开启（只有明确关过才保持关闭）──
-  const [autoImport, setAutoImport] = useState(true);
+  // ── 智能自动入库：默认关（草稿箱模式——先确认再入库）；开过才保持开 ──
+  const [autoImport, setAutoImport] = useState(false);
   useEffect(() => {
-    setAutoImport(localStorage.getItem(AUTO_IMPORT_KEY) !== "0");
+    setAutoImport(localStorage.getItem(AUTO_IMPORT_KEY) === "1");
   }, []);
   const toggleAutoImport = useCallback(() => {
     setAutoImport((v) => {
@@ -292,6 +495,13 @@ export function NetworkDashboard() {
     window.setTimeout(() => setToast(""), 2200);
   }, []);
 
+  // 合作事项提取在组件外完成，通过事件广播提示
+  useEffect(() => {
+    const handler = (e: Event) => notify((e as CustomEvent<string>).detail);
+    window.addEventListener("network-toast", handler);
+    return () => window.removeEventListener("network-toast", handler);
+  }, [notify]);
+
   // ── 微信 Agent 待入库：确认/忽略 ──
 
   const removePending = useCallback((ids: string[]) => {
@@ -304,27 +514,35 @@ export function NetworkDashboard() {
   }, []);
 
   const acceptPending = useCallback((item: PendingImport) => {
-    if (!item.result?.person?.name) { removePending([item.id]); return; }
-    const { next, person, existingId } = applyAnalyzeResult(storeRef.current, item.result);
+    if (!item.result?.person?.name || isSelfName(item.result.person.name)) { removePending([item.id]); return; }
+    const before = storeRef.current;
+    const { next, person, existingId } = applyAnalyzeResult(before, item.result);
     save(next);
     removePending([item.id]);
     setSelectedId(person.id);
     notify(existingId ? `已更新 ${person.name} 的资料` : `已入库 ${person.name}`);
+    // 合作事项提取：摘要当语料（fire-and-forget）
+    extractDealsInBackground(next, person, [item.result.summary, item.result.ourMove?.nextAction].filter(Boolean).join("；"), save);
   }, [save, notify, removePending]);
 
   const acceptAllPending = useCallback(() => {
-    const valid = pendingImports.filter((x) => x.result?.person?.name);
+    const valid = pendingImports.filter((x) => x.result?.person?.name && !isSelfName(x.result.person.name));
     if (!valid.length) { removePending(pendingImports.map((x) => x.id)); return; }
     let cur = storeRef.current;
     let updated = 0;
+    const imported: Array<{ person: Person; result: AnalyzeResult }> = [];
     for (const item of valid) {
       const r = applyAnalyzeResult(cur, item.result);
       cur = r.next;
       if (r.existingId) updated++;
+      imported.push({ person: r.person, result: item.result });
     }
     save(cur);
     removePending(valid.map((x) => x.id));
     notify(`已入库 ${valid.length} 人（${updated} 人为更新）`);
+    for (const { person, result } of imported) {
+      extractDealsInBackground(cur, person, [result.summary, result.ourMove?.nextAction].filter(Boolean).join("；"), save);
+    }
   }, [pendingImports, save, notify, removePending]);
 
   // ── 智能自动入库：开关打开时，有价值的条目直接入库（不用点确认）──
@@ -336,20 +554,25 @@ export function NetworkDashboard() {
       const cat = r?.intent?.category;
       return (cat === "闲聊维护" || cat === "无明显意向") && !r?.businessMatch?.matchedBusiness && !r?.person?.whatTheyWant;
     };
-    const auto = pendingImports.filter((x) => x.result?.person?.name && !lowValue(x));
-    const junk = pendingImports.filter((x) => !x.result?.person?.name).map((x) => x.id);
+    const auto = pendingImports.filter((x) => x.result?.person?.name && !isSelfName(x.result.person.name) && !lowValue(x));
+    const junk = pendingImports.filter((x) => !x.result?.person?.name || isSelfName(x.result.person.name)).map((x) => x.id);
     if (junk.length) removePending(junk);
     if (!auto.length) return;
     let cur = storeRef.current;
     let updated = 0;
+    const imported: Array<{ person: Person; result: AnalyzeResult }> = [];
     for (const item of auto) {
       const r = applyAnalyzeResult(cur, item.result);
       cur = r.next;
       if (r.existingId) updated++;
+      imported.push({ person: r.person, result: item.result });
     }
     save(cur);
     removePending(auto.map((x) => x.id));
     notify(`⚡ 自动入库 ${auto.length} 人${updated ? `（${updated} 人为更新）` : ""}`);
+    for (const { person, result } of imported) {
+      extractDealsInBackground(cur, person, [result.summary, result.ourMove?.nextAction].filter(Boolean).join("；"), save);
+    }
   }, [autoImport, pendingImports, save, notify, removePending]);
 
   // ── 攒批中的消息立即触发分析（不用等 4 分钟）──
@@ -403,6 +626,84 @@ export function NetworkDashboard() {
       ),
     });
     notify(`已延后 ${days} 天`);
+  }, [store, save, notify]);
+
+  // 删除人脉：连带互动记录与合作事项
+  const deletePerson = useCallback((p: Person) => {
+    save({
+      ...store,
+      people: store.people.filter((x) => x.id !== p.id),
+      interactions: store.interactions.filter((i) => i.personId !== p.id),
+      deals: (store.deals ?? []).filter((d) => d.personId !== p.id),
+    });
+    setSelectedId(null);
+    notify(`已删除 ${p.name}（含互动记录与合作事项）`);
+  }, [store, save, notify]);
+
+  // 合作状态统一处理：达成 → 自动安排 7 天后回访反馈（用户不点就一直提醒）
+  const markDealStatus = useCallback((deal: Deal, status: DealStatus) => {
+    const today = localToday();
+    let deals = (store.deals ?? []).map((d) =>
+      d.id === deal.id
+        ? { ...d, status, updatedAt: today, closedAt: status === "推进中" ? undefined : today, nextFollowUpDate: status === "推进中" ? localDatePlus(today, 7) : undefined }
+        : d,
+    );
+    if (status === "达成") {
+      deals.push({
+        id: `deal-fb-${Date.now()}`,
+        personId: deal.personId,
+        title: `回访：「${deal.title}」合作反馈`,
+        status: "推进中",
+        nextStep: "问合作效果、收获和问题，记录反馈",
+        nextFollowUpDate: localDatePlus(today, 7),
+        createdAt: today,
+        updatedAt: today,
+        isFollowUpVisit: true,
+      });
+    }
+    save({ ...store, deals });
+    notify(status === "达成" ? `🎉 「${deal.title}」已达成！7 天后自动提醒回访反馈` : `「${deal.title}」已标记${status}`);
+  }, [store, save, notify]);
+
+  // 记录合作反馈：写进合作 + 回写关系表（备注/互动记录），星级随互动自动变化
+  const submitFeedback = useCallback((deal: Deal, text: string) => {
+    const today = localToday();
+    const person = store.people.find((p) => p.id === deal.personId);
+    const originTitle = (deal.title.match(/「(.+?)」/) ?? [])[1] ?? deal.title;
+    const deals = (store.deals ?? []).map((d) =>
+      d.id === deal.id
+        ? {
+            ...d,
+            feedback: [d.feedback, `${today}：${text}`].filter(Boolean).join("\n"),
+            feedbackAt: today,
+            status: "完结" as DealStatus,
+            closedAt: today,
+            nextFollowUpDate: undefined,
+            updatedAt: today,
+          }
+        : d,
+    );
+    const interaction: Interaction = {
+      id: `int-${Date.now()}`,
+      personId: deal.personId,
+      date: today,
+      channel: "其他",
+      summary: `🤝 合作反馈（${originTitle}）：${text}`,
+    };
+    save({
+      ...store,
+      deals,
+      interactions: [...store.interactions, interaction],
+      people: person
+        ? store.people.map((p) =>
+            p.id === person.id
+              ? { ...p, notes: [p.notes, `🤝 合作反馈 · ${today}：「${originTitle}」${text}`].filter(Boolean).join("\n\n"), updatedAt: today }
+              : p,
+          )
+        : store.people,
+    });
+    setFeedbackDeal(null);
+    notify(`反馈已记录，并写进${person?.name ?? "对方"}的档案`);
   }, [store, save, notify]);
 
   const copyScript = useCallback((p: Person) => {
@@ -565,55 +866,55 @@ export function NetworkDashboard() {
   // ── Render ──
 
   return (
-    <main className="min-h-screen bg-[#0a0a0f] text-white">
+    <main className="min-h-screen bg-[#f4fbfa] text-[#0d3b39]">
       <div className="pointer-events-none fixed inset-0 overflow-hidden">
-        <div className="absolute -top-40 left-1/4 h-[600px] w-[600px] rounded-full bg-indigo-500/10 blur-[120px]" />
-        <div className="absolute top-1/3 -right-40 h-[500px] w-[500px] rounded-full bg-emerald-500/8 blur-[100px]" />
-        <div className="absolute -bottom-20 left-1/3 h-[400px] w-[400px] rounded-full bg-amber-500/6 blur-[80px]" />
+        <div className="absolute -top-40 left-1/4 h-[600px] w-[600px] rounded-full bg-[#0ABAB5]/15 blur-[120px]" />
+        <div className="absolute top-1/3 -right-40 h-[500px] w-[500px] rounded-full bg-[#0ABAB5]/12 blur-[100px]" />
+        <div className="absolute -bottom-20 left-1/3 h-[400px] w-[400px] rounded-full bg-[#0ABAB5]/10 blur-[80px]" />
       </div>
 
       <div className="relative mx-auto max-w-5xl px-4 py-6 md:px-8">
         {/* Header */}
         <header className="mb-6 flex items-center justify-between">
           <div>
-            <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-widest text-white/40">
+            <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-widest text-[#0d3b39]/65">
               <Network className="size-3.5" /> Network
             </div>
             <h1 className="mt-1 text-2xl font-semibold tracking-tight">人脉工作台</h1>
           </div>
           <div className="flex gap-2">
-            <Button variant="ghost" size="sm" onClick={importData} className="text-white/60 hover:bg-white/10 hover:text-white" title="导入备份">
+            <Button variant="ghost" size="sm" onClick={importData} className="text-[#0d3b39]/85 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]" title="导入备份">
               <Upload className="size-4" />
             </Button>
-            <Button variant="ghost" size="sm" onClick={exportData} className="text-white/60 hover:bg-white/10 hover:text-white" title="导出备份">
+            <Button variant="ghost" size="sm" onClick={exportData} className="text-[#0d3b39]/85 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]" title="导出备份">
               <Download className="size-4" />
             </Button>
-            <Button size="sm" onClick={() => setHubOpen(true)} className="border-0 bg-emerald-500/20 text-emerald-100 hover:bg-emerald-500/30">
+            <Button size="sm" onClick={() => setHubOpen(true)} className="border-0 bg-[#0ABAB5] text-white hover:bg-[#08948F]">
               <ScanText className="size-4" /> 快速导入
             </Button>
-            <Button size="sm" onClick={() => openAdd()} className="border-0 bg-white/10 text-white hover:bg-white/20">
+            <Button size="sm" onClick={() => openAdd()} className="border-0 bg-[#0ABAB5]/[0.12] text-[#0d3b39] hover:bg-[#0ABAB5]/[0.22]">
               <Plus className="size-4" /> 添加人脉
             </Button>
           </div>
         </header>
 
         {/* 微信自动入库：解释入口与当前服务状态 */}
-        <section className="mb-6 rounded-xl border border-white/10 bg-white/[0.03] p-4">
+        <section className="mb-6 rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.04] p-4">
           <div className="flex items-center justify-between gap-2">
             <button onClick={() => setIngestHelpOpen((v) => !v)} className="flex min-w-0 items-center gap-2 text-left">
-              <span className="flex min-w-0 items-center gap-2 text-sm font-medium text-white/75">
-                <MessageCircle className="size-4 shrink-0 text-emerald-300" />
+              <span className="flex min-w-0 items-center gap-2 text-sm font-medium text-[#0d3b39]/75">
+                <MessageCircle className="size-4 shrink-0 text-emerald-600" />
                 <span className="truncate">微信自动入库怎么工作？</span>
-                <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] ${ingestConnected === true ? "bg-emerald-500/15 text-emerald-300" : ingestConnected === false ? "bg-amber-500/15 text-amber-300" : "bg-white/10 text-white/40"}`}>
+                <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] ${ingestConnected === true ? "bg-emerald-500/15 text-emerald-600" : ingestConnected === false ? "bg-amber-500/15 text-amber-600" : "bg-[#0ABAB5]/[0.12] text-[#0d3b39]/65"}`}>
                   {ingestConnected === true ? "本地接口在线" : ingestConnected === false ? "接口未连接" : "检查中"}
                 </span>
               </span>
-              {ingestHelpOpen ? <ChevronUp className="size-4 shrink-0 text-white/40" /> : <ChevronDown className="size-4 shrink-0 text-white/40" />}
+              {ingestHelpOpen ? <ChevronUp className="size-4 shrink-0 text-[#0d3b39]/65" /> : <ChevronDown className="size-4 shrink-0 text-[#0d3b39]/65" />}
             </button>
             {/* 智能自动入库开关：打开后聊天/截图分析完直接入库，不用手点 */}
             <button
               onClick={toggleAutoImport}
-              className={`flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium transition-all ${autoImport ? "bg-emerald-500/20 text-emerald-300" : "bg-white/5 text-white/40 hover:bg-white/10"}`}
+              className={`flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium transition-all ${autoImport ? "bg-emerald-500/20 text-emerald-600" : "bg-[#0ABAB5]/[0.06] text-[#0d3b39]/85 hover:bg-[#0ABAB5]/[0.12]"}`}
               title={autoImport ? "已开启：有业务价值的人脉自动入库，纯闲聊留在待确认" : "关闭中：所有分析结果都停在待确认，需手动入库"}
             >
               <span className={`size-1.5 rounded-full ${autoImport ? "bg-emerald-400" : "bg-white/30"}`} />
@@ -621,47 +922,47 @@ export function NetworkDashboard() {
             </button>
           </div>
           {autoImport && (
-            <p className="mt-2 text-[11px] text-emerald-300/60">已开启：微信聊天 / 截图 / 剪贴板分析完成后直接入库（同名自动合并），纯闲聊和无法判断的仍留在下方待确认。</p>
+            <p className="mt-2 text-[11px] text-emerald-600/60">已开启：微信聊天 / 截图 / 剪贴板分析完成后直接入库（同名自动合并），纯闲聊和无法判断的仍留在下方待确认。</p>
           )}
-          {!autoImport && <p className="mt-2 text-xs text-white/40">它不会自动读取整部手机微信；只有被 Agent/助手实际送到本系统的消息，才会进入分析。</p>}
+          {!autoImport && <p className="mt-2 text-xs text-[#0d3b39]/65">它不会自动读取整部手机微信；只有被 Agent/助手实际送到本系统的消息，才会进入分析。</p>}
           {ingestHelpOpen && (
-            <div className="mt-4 grid gap-3 text-xs text-white/60 md:grid-cols-3">
-              <div className="rounded-lg bg-white/[0.04] p-3">
-                <strong className="text-white/80">剪贴板 Agent</strong>
+            <div className="mt-4 grid gap-3 text-xs text-[#0d3b39]/85 md:grid-cols-3">
+              <div className="rounded-lg bg-[#0ABAB5]/[0.06] p-3">
+                <strong className="text-[#0d3b39]/80">剪贴板 Agent</strong>
                 <p className="mt-1 leading-5">你在微信中选中一段聊天并按 Cmd+C，它只读取这次复制的文本。没有主动复制，就不会读到任何聊天。</p>
               </div>
-              <div className="rounded-lg bg-white/[0.04] p-3">
-                <strong className="text-white/80">微信助手接口</strong>
-                <p className="mt-1 leading-5">只接收助手账号实际收到、并 POST 到 <code className="text-emerald-300">/api/network/ingest</code> 的私聊文本；群聊、非文本和 # 指令默认跳过。</p>
+              <div className="rounded-lg bg-[#0ABAB5]/[0.06] p-3">
+                <strong className="text-[#0d3b39]/80">微信助手接口</strong>
+                <p className="mt-1 leading-5">只接收助手账号实际收到、并 POST 到 <code className="text-emerald-600">/api/network/ingest</code> 的私聊文本；群聊、非文本和 # 指令默认跳过。</p>
               </div>
-              <div className="rounded-lg bg-white/[0.04] p-3">
-                <strong className="text-white/80">分析与入库</strong>
+              <div className="rounded-lg bg-[#0ABAB5]/[0.06] p-3">
+                <strong className="text-[#0d3b39]/80">分析与入库</strong>
                 <p className="mt-1 leading-5">同一联系人攒满 20 条，或 4 分钟没有新消息，才调用 AI。分析后先放在下方待确认，点击「入库」才会保存。</p>
               </div>
-              <div className="md:col-span-3 rounded-lg border border-amber-500/15 bg-amber-500/[0.05] p-3 leading-5 text-amber-100/70">
+              <div className="md:col-span-3 rounded-lg border border-amber-500/15 bg-amber-500/[0.05] p-3 leading-5 text-amber-700/70">
                 没录入通常是因为：助手根本看不到那段聊天、消息被识别为群聊/指令、接口未推送、仍在 4 分钟攒批中、AI 分析失败，或你还没有点击「入库」。系统不会因为“聊过一次”就自动写入人脉库。
               </div>
               {ingestBuffers.length > 0 && (
-                <div className="md:col-span-3 rounded-lg bg-indigo-500/[0.08] p-3 text-indigo-100/75">
+                <div className="md:col-span-3 rounded-lg bg-[#0ABAB5]/[0.08] p-3 text-[#08948F]/75">
                   <div className="flex items-center justify-between gap-2">
-                    <div className="font-medium text-indigo-200">当前正在等待分析</div>
-                    <button onClick={flushIngest} className="shrink-0 rounded-lg bg-indigo-500/25 px-2.5 py-1 text-[11px] text-indigo-100 transition-colors hover:bg-indigo-500/40">
+                    <div className="font-medium text-[#08948F]">当前正在等待分析</div>
+                    <button onClick={flushIngest} className="shrink-0 rounded-lg bg-[#0ABAB5]/20 px-2.5 py-1 text-[11px] text-[#08948F] transition-colors hover:bg-#08948F/40">
                       立即分析（不等 4 分钟）
                     </button>
                   </div>
-                  <div className="mt-1 flex flex-wrap gap-2">{ingestBuffers.map((b) => <span key={b.from} className="rounded-full bg-indigo-500/15 px-2 py-1">{b.from} · {b.count} 条</span>)}</div>
+                  <div className="mt-1 flex flex-wrap gap-2">{ingestBuffers.map((b) => <span key={b.from} className="rounded-full bg-[#0ABAB5]/12 px-2 py-1">{b.from} · {b.count} 条</span>)}</div>
                 </div>
               )}
               {ingestRecent.some((x) => !x.ok) && (
-                <div className="md:col-span-3 text-amber-300/70">最近一次分析失败：{ingestRecent.find((x) => !x.ok)?.error ?? "请检查 Agent 日志和 API 配置"}</div>
+                <div className="md:col-span-3 text-amber-600/70">最近一次分析失败：{ingestRecent.find((x) => !x.ok)?.error ?? "请检查 Agent 日志和 API 配置"}</div>
               )}
-              {ingestCheckedAt && <div className="md:col-span-3 text-[10px] text-white/25">状态检查：{new Date(ingestCheckedAt).toLocaleTimeString()}</div>}
+              {ingestCheckedAt && <div className="md:col-span-3 text-[10px] text-[#0d3b39]/70">状态检查：{new Date(ingestCheckedAt).toLocaleTimeString()}</div>}
             </div>
           )}
         </section>
 
         {/* Tabs */}
-        <div className="mb-6 flex gap-1 rounded-xl bg-white/5 p-1 backdrop-blur-xl">
+        <div className="mb-6 flex gap-1 rounded-xl bg-[#0ABAB5]/[0.06] p-1 backdrop-blur-xl">
           {([
             { id: "actions" as Tab, label: "今日行动", icon: Sparkles, count: actions.length },
             { id: "people" as Tab, label: "人脉", icon: Users, count: store.people.length },
@@ -671,27 +972,30 @@ export function NetworkDashboard() {
               key={t.id}
               onClick={() => setTab(t.id)}
               className={`flex flex-1 items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium transition-all ${
-                tab === t.id ? "bg-white/10 text-white shadow-sm" : "text-white/50 hover:text-white/70"
+                tab === t.id ? "bg-[#0ABAB5]/[0.12] text-[#0d3b39] shadow-sm" : "text-[#0d3b39]/75 hover:text-[#0d3b39]/70"
               }`}
             >
               <t.icon className="size-3.5" />
               {t.label}
-              <span className="text-xs text-white/30">{t.count}</span>
+              <span className="text-xs text-[#0d3b39]/60">{t.count}</span>
             </button>
           ))}
         </div>
 
-        {/* ── 微信 Agent 待确认入库 ── */}
+        {/* ── 草稿箱：识别完成的人脉先放这里，确认后才入正式库 ── */}
         {pendingImports.length > 0 && (
           <div className="mb-6 rounded-xl border border-amber-500/25 bg-amber-500/[0.06] p-4 backdrop-blur-xl">
             <div className="flex items-center justify-between gap-2">
-              <span className="flex items-center gap-2 text-sm font-medium text-amber-300">
+              <span className="flex items-center gap-2 text-sm font-medium text-amber-600">
                 <MessageCircle className="size-4" />
-                微信助手转来 {pendingImports.length} 条人脉待确认
-                {autoImport && <span className="rounded-full bg-emerald-500/15 px-1.5 py-0.5 text-[10px] text-emerald-300">自动入库开启中·这些是筛下来的低价值/待判断条目</span>}
+                草稿箱 · {pendingImports.length} 条人脉待确认
+                {autoImport && <span className="rounded-full bg-emerald-500/15 px-1.5 py-0.5 text-[10px] text-emerald-600">自动入库开启中·低价值条目仍留在此处</span>}
               </span>
               <div className="flex gap-2">
-                <Button size="sm" onClick={acceptAllPending} className="h-7 border-0 bg-amber-500/25 px-3 text-xs text-amber-100 hover:bg-amber-500/40">
+                <Button size="sm" variant="ghost" onClick={() => removePending(pendingImports.map((x) => x.id))} className="h-7 px-3 text-xs text-[#0d3b39]/65 hover:bg-red-500/15 hover:text-red-600">
+                  全部删除
+                </Button>
+                <Button size="sm" onClick={acceptAllPending} className="h-7 border-0 bg-amber-500/25 px-3 text-xs text-amber-700 hover:bg-amber-500/40">
                   <Check className="size-3" /> 全部入库
                 </Button>
               </div>
@@ -702,39 +1006,39 @@ export function NetworkDashboard() {
                 const intentColor = INTENT_COLORS[r.intent?.category] ?? "#6b7280";
                 const exists = store.people.some((p) => p.name === (r.person?.name ?? "").trim());
                 return (
-                  <div key={item.id} className="rounded-lg border border-white/10 bg-black/20 p-3">
+                  <div key={item.id} className="rounded-lg border border-[#0ABAB5]/25 bg-[#0d3b39]/20 p-3">
                     <div className="flex items-start gap-3">
                       <div className="min-w-0 flex-1">
                         <div className="flex flex-wrap items-center gap-2">
                           <span className="text-sm font-medium">{r.person?.name ?? "未知"}</span>
-                          <span className="text-[10px] text-white/30">{item.source.replace("wechat-", "微信 · ")}</span>
-                          {r.person?.title && <span className="text-xs text-white/40">{r.person.title}</span>}
-                          {r.person?.org && <span className="text-xs text-white/40">· {r.person.org}</span>}
+                          <span className="text-[10px] text-[#0d3b39]/70">{item.source.replace("wechat-", "微信 · ")}</span>
+                          {r.person?.title && <span className="text-xs text-[#0d3b39]/65">{r.person.title}</span>}
+                          {r.person?.org && <span className="text-xs text-[#0d3b39]/65">· {r.person.org}</span>}
                           {r.intent?.category && (
                             <span className="rounded-full px-1.5 py-0.5 text-[10px]" style={{ backgroundColor: intentColor + "25", color: intentColor }}>
                               {r.intent.category}
                             </span>
                           )}
                           {exists && (
-                            <span className="rounded-full bg-emerald-500/20 px-1.5 py-0.5 text-[10px] text-emerald-300">已有 → 将更新</span>
+                            <span className="rounded-full bg-emerald-500/20 px-1.5 py-0.5 text-[10px] text-emerald-600">已有 → 将更新</span>
                           )}
                         </div>
                         {item.meta?.messageCount && (
-                          <p className="mt-1 text-[10px] text-white/30">本批 {item.meta.messageCount} 条 · {new Date(item.queuedAt).toLocaleString()}</p>
+                          <p className="mt-1 text-[10px] text-[#0d3b39]/70">本批 {item.meta.messageCount} 条 · {new Date(item.queuedAt).toLocaleString()}</p>
                         )}
                         {r.businessMatch?.matchedBusiness && (
-                          <p className="mt-1 text-[11px] text-amber-200/70">🎯 {r.businessMatch.matchedBusiness}：{r.businessMatch.suggestion}</p>
+                          <p className="mt-1 text-[11px] text-amber-700/70">🎯 {r.businessMatch.matchedBusiness}：{r.businessMatch.suggestion}</p>
                         )}
                         {r.ourMove?.suggestedReply && (
-                          <p className="mt-1 line-clamp-2 text-[11px] leading-4 text-white/40">回复建议：{r.ourMove.suggestedReply}</p>
+                          <p className="mt-1 line-clamp-2 text-[11px] leading-4 text-[#0d3b39]/65">回复建议：{r.ourMove.suggestedReply}</p>
                         )}
                       </div>
                       <div className="flex shrink-0 flex-col gap-1.5">
-                        <Button size="sm" variant="ghost" onClick={() => acceptPending(item)} className="h-7 px-2.5 text-xs text-amber-200 hover:bg-amber-500/20">
+                        <Button size="sm" variant="ghost" onClick={() => acceptPending(item)} className="h-7 px-2.5 text-xs text-amber-700 hover:bg-amber-500/20">
                           <Check className="size-3" /> 入库
                         </Button>
-                        <Button size="sm" variant="ghost" onClick={() => removePending([item.id])} className="h-7 px-2.5 text-xs text-white/35 hover:bg-white/10 hover:text-white/70">
-                          忽略
+                        <Button size="sm" variant="ghost" onClick={() => removePending([item.id])} className="h-7 px-2.5 text-xs text-[#0d3b39]/65 hover:bg-red-500/15 hover:text-red-600">
+                          删除
                         </Button>
                       </div>
                     </div>
@@ -748,12 +1052,28 @@ export function NetworkDashboard() {
         {/* ── 今日行动 ── */}
         {tab === "actions" && (
           <div className="space-y-5">
+            {/* 合作事项到期：最高优先级 push */}
+            {actions.filter((a) => a.urgency === "deal-overdue").length > 0 && (
+              <section>
+                <h2 className="mb-3 flex items-center gap-2 text-sm font-medium text-red-600">
+                  📋 合作待推进（到了跟进日期，还没闭环）
+                </h2>
+                <div className="space-y-2">
+                  {actions.filter((a) => a.urgency === "deal-overdue").map((a) => (
+                    <ActionCard key={`${a.person.id}-${a.deal!.id}`} action={a} orgOf={orgOf} onContact={markContacted} onSnooze={snooze} onSelect={setSelectedId} onCopy={copyScript} copied={copied}
+                      onDealStatus={markDealStatus}
+                      onRecordFeedback={(deal) => setFeedbackDeal(deal)}
+                    />
+                  ))}
+                </div>
+              </section>
+            )}
             {(["overdue", "today"] as const).map((u) => {
               const list = actions.filter((a) => a.urgency === u);
               if (!list.length) return null;
               return (
                 <section key={u}>
-                  <h2 className={`mb-3 flex items-center gap-2 text-sm font-medium ${u === "overdue" ? "text-red-400" : "text-amber-400"}`}>
+                  <h2 className={`mb-3 flex items-center gap-2 text-sm font-medium ${u === "overdue" ? "text-red-600" : "text-amber-600"}`}>
                     <Calendar className="size-4" /> {u === "overdue" ? "已逾期" : "今天该联系"}
                   </h2>
                   <div className="space-y-2">
@@ -766,7 +1086,7 @@ export function NetworkDashboard() {
             })}
             {actions.filter((a) => a.urgency === "soon").length > 0 && (
               <section>
-                <h2 className="mb-3 flex items-center gap-2 text-sm font-medium text-white/60">
+                <h2 className="mb-3 flex items-center gap-2 text-sm font-medium text-[#0d3b39]/85">
                   <ArrowRight className="size-4" /> 即将到期
                 </h2>
                 <div className="space-y-2">
@@ -778,7 +1098,7 @@ export function NetworkDashboard() {
             )}
             {actions.filter((a) => a.urgency === "suggested").length > 0 && (
               <section>
-                <h2 className="mb-3 flex items-center gap-2 text-sm font-medium text-white/50">
+                <h2 className="mb-3 flex items-center gap-2 text-sm font-medium text-[#0d3b39]/75">
                   <Sparkles className="size-4" /> 建议联系
                 </h2>
                 <div className="space-y-2">
@@ -806,12 +1126,12 @@ export function NetworkDashboard() {
           <div>
             <div className="mb-4 space-y-3">
               <div className="relative">
-                <Search className="absolute left-3 top-2.5 size-4 text-white/30" />
+                <Search className="absolute left-3 top-2.5 size-4 text-[#0d3b39]/60" />
                 <input
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
                   placeholder="搜索姓名、组织、标签…"
-                  className="w-full rounded-xl border border-white/10 bg-white/5 py-2 pl-9 pr-3 text-sm text-white outline-none backdrop-blur-xl placeholder-white/30 focus:border-white/20"
+                  className="w-full rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] py-2 pl-9 pr-3 text-sm text-[#0d3b39] outline-none backdrop-blur-xl placeholder-[#0d3b39]/60 focus:border-[#0ABAB5]/40"
                 />
               </div>
               <div className="flex flex-wrap gap-2">
@@ -823,7 +1143,7 @@ export function NetworkDashboard() {
               </div>
               {allTags.length > 0 && (
                 <div className="flex flex-wrap items-center gap-2">
-                  <Tag className="size-3.5 text-white/30" />
+                  <Tag className="size-3.5 text-[#0d3b39]/60" />
                   {allTags.slice(0, 12).map(([t, n]) => (
                     <FilterButton key={t} active={tagFilter === t} onClick={() => setTagFilter(tagFilter === t ? null : t)}>
                       {t} <span className="ml-0.5 text-xs opacity-50">{n}</span>
@@ -832,18 +1152,18 @@ export function NetworkDashboard() {
                 </div>
               )}
               {orgFilter && (
-                <div className="flex items-center gap-2 text-xs text-white/40">
+                <div className="flex items-center gap-2 text-xs text-[#0d3b39]/65">
                   组织筛选：
-                  <span className="rounded-md bg-white/10 px-2 py-1 text-white/70">
+                  <span className="rounded-md bg-[#0ABAB5]/[0.12] px-2 py-1 text-[#0d3b39]/70">
                     {store.organizations.find((o) => o.id === orgFilter)?.name}
                   </span>
-                  <button onClick={() => setOrgFilter(null)} className="text-white/40 hover:text-white"><X className="size-3.5" /></button>
+                  <button onClick={() => setOrgFilter(null)} className="text-[#0d3b39]/65 hover:text-[#0d3b39]"><X className="size-3.5" /></button>
                 </div>
               )}
             </div>
             <div className="space-y-2">
               {filteredPeople.map((p) => (
-                <PersonRow key={p.id} person={p} org={orgOf(p)} onSelect={setSelectedId} />
+                <PersonRow key={p.id} person={p} org={orgOf(p)} store={store} onSelect={setSelectedId} />
               ))}
               {filteredPeople.length === 0 && (
                 <EmptyState
@@ -862,30 +1182,30 @@ export function NetworkDashboard() {
           <div>
             <div className="mb-4">
               <div className="relative">
-                <Search className="absolute left-3 top-2.5 size-4 text-white/30" />
+                <Search className="absolute left-3 top-2.5 size-4 text-[#0d3b39]/60" />
                 <input
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
                   placeholder="搜索组织…"
-                  className="w-full rounded-xl border border-white/10 bg-white/5 py-2 pl-9 pr-3 text-sm text-white outline-none backdrop-blur-xl placeholder-white/30 focus:border-white/20"
+                  className="w-full rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] py-2 pl-9 pr-3 text-sm text-[#0d3b39] outline-none backdrop-blur-xl placeholder-[#0d3b39]/60 focus:border-[#0ABAB5]/40"
                 />
               </div>
               <div className="mt-2 flex items-center justify-between">
-                <p className="text-xs text-white/30">组织是你能触达的渠道，点击组织把里面的人加进来</p>
+                <p className="text-xs text-[#0d3b39]/60">组织是你能触达的渠道，点击组织把里面的人加进来</p>
                 {orgBatch ? (
                   <div className="flex items-center gap-2 rounded-lg bg-violet-500/15 px-2.5 py-1">
                     <span className="size-3 animate-spin rounded-full border-2 border-violet-300/30 border-t-violet-300" />
-                    <span className="text-xs text-violet-200">
+                    <span className="text-xs text-violet-700">
                       正在检索「{orgBatch.current}」{orgBatch.done}/{orgBatch.total}（找到 {orgBatch.found}）
                     </span>
-                    <button onClick={stopBatchOrgResearch} className="text-xs text-white/40 hover:text-white">停止</button>
+                    <button onClick={stopBatchOrgResearch} className="text-xs text-[#0d3b39]/65 hover:text-[#0d3b39]">停止</button>
                   </div>
                 ) : (
                   store.organizations.filter((o) => !o.notes).length > 0 && (
                     <button
                       onClick={runBatchOrgResearch}
                       disabled={!!orgBusyId}
-                      className="flex items-center gap-1 rounded-lg bg-violet-500/20 px-2.5 py-1 text-xs text-violet-200 transition-colors hover:bg-violet-500/30 disabled:opacity-40"
+                      className="flex items-center gap-1 rounded-lg bg-violet-500/20 px-2.5 py-1 text-xs text-violet-700 transition-colors hover:bg-violet-500/30 disabled:opacity-40"
                     >
                       <Sparkles className="size-3" />
                       AI 批量补资料（{store.organizations.filter((o) => !o.notes).length} 个待补）
@@ -901,19 +1221,19 @@ export function NetworkDashboard() {
                 return (
                   <div
                     key={o.id}
-                    className="group rounded-xl border border-white/5 bg-white/[0.03] p-3 backdrop-blur-xl transition-all hover:border-white/10 hover:bg-white/[0.06]"
+                    className="group rounded-xl border border-[#0ABAB5]/15 bg-[#0ABAB5]/[0.04] p-3 backdrop-blur-xl transition-all hover:border-[#0ABAB5]/25 hover:bg-[#0ABAB5]/[0.08]"
                   >
                     <div className="flex items-start justify-between gap-2">
                       <button onClick={() => { setOrgFilter(o.id); setTab("people"); setQuery(""); }} className="min-w-0 flex-1 text-left">
                         <span className="text-sm font-medium leading-5">{o.name}</span>
-                        <div className="mt-1.5 flex items-center gap-2 text-xs text-white/40">
+                        <div className="mt-1.5 flex items-center gap-2 text-xs text-[#0d3b39]/65">
                           <span className="inline-block size-2 rounded-full" style={{ backgroundColor: CATEGORY_COLORS[o.category] }} />
                           {o.category}
                         </div>
-                        <div className="mt-1 text-xs text-white/30">
+                        <div className="mt-1 text-xs text-[#0d3b39]/60">
                           {count > 0 ? `${count} 位联系人` : "还没添加人"}
                         </div>
-                        {o.notes && <p className="mt-1.5 line-clamp-2 text-[11px] leading-4 text-white/35">{o.notes}</p>}
+                        {o.notes && <p className="mt-1.5 line-clamp-2 text-[11px] leading-4 text-[#0d3b39]/65">{o.notes}</p>}
                       </button>
                       <div className="flex shrink-0 flex-col items-end gap-1.5">
                         <span
@@ -926,7 +1246,7 @@ export function NetworkDashboard() {
                           onClick={() => researchOneOrg(o)}
                           disabled={researching || !!orgBatch}
                           title="AI 联网检索这个组织的资料"
-                          className="flex items-center gap-1 rounded-md bg-white/5 px-1.5 py-0.5 text-[10px] text-white/40 opacity-0 transition-all hover:bg-white/10 hover:text-white group-hover:opacity-100 disabled:opacity-60"
+                          className="flex items-center gap-1 rounded-md bg-[#0ABAB5]/[0.06] px-1.5 py-0.5 text-[10px] text-[#0d3b39]/65 opacity-0 transition-all hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39] group-hover:opacity-100 disabled:opacity-60"
                         >
                           {researching ? (
                             <span className="size-2.5 animate-spin rounded-full border-2 border-white/30 border-t-white" />
@@ -939,7 +1259,7 @@ export function NetworkDashboard() {
                     </div>
                     <button
                       onClick={() => openAdd(o.id)}
-                      className="mt-2 flex w-full items-center justify-center gap-1 rounded-lg bg-white/5 py-1.5 text-xs text-white/50 opacity-0 transition-all hover:bg-white/10 hover:text-white group-hover:opacity-100"
+                      className="mt-2 flex w-full items-center justify-center gap-1 rounded-lg bg-[#0ABAB5]/[0.06] py-1.5 text-xs text-[#0d3b39]/75 opacity-0 transition-all hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39] group-hover:opacity-100"
                     >
                       <Plus className="size-3" /> 添加此人脉
                     </button>
@@ -1011,14 +1331,33 @@ export function NetworkDashboard() {
             onChatText={(text) => { setVoiceOpen(false); setChatInitialText(text); setChatOpen(true); }}
             onBatchText={(text) => { setVoiceOpen(false); setBatchInitialText(text); setBatchOpen(true); }}
             onSave={(p, newOrg) => {
-              save({
+              const next: NetworkStore = {
                 ...store,
                 people: [...store.people, p],
                 organizations: newOrg ? [...store.organizations, newOrg] : store.organizations,
-              });
+              };
+              save(next);
               setVoiceOpen(false);
               setSelectedId(p.id);
               notify(newOrg ? `已录入 ${p.name}，新组织「${newOrg.name}」已入库` : `已录入 ${p.name}`);
+              // 口述里可能已经聊了合作方向 → 自动提取
+              const noteText = p.notes ?? "";
+              const spoken = noteText.replace(/^来源：口述录入 · /, "");
+              extractDealsInBackground(next, p, spoken.length > 15 ? spoken : p.cooperation ?? "", save);
+            }}
+            onSaveMerged={(p, interaction, newOrg) => {
+              const next: NetworkStore = {
+                ...store,
+                people: store.people.map((x) => (x.id === p.id ? p : x)),
+                organizations: newOrg ? [...store.organizations, newOrg] : store.organizations,
+                interactions: [...store.interactions, interaction],
+              };
+              save(next);
+              setVoiceOpen(false);
+              setSelectedId(p.id);
+              notify(`已把新信息合并到 ${p.name}`);
+              // 口述里有合作进展 → 自动提取/更新合作事项
+              extractDealsInBackground(next, p, interaction.summary, save);
             }}
           />
         )}
@@ -1090,6 +1429,16 @@ export function NetworkDashboard() {
           />
         )}
 
+        {/* ── 合作反馈弹窗 ── */}
+        {feedbackDeal && (
+          <FeedbackModal
+            deal={feedbackDeal}
+            personName={store.people.find((p) => p.id === feedbackDeal.personId)?.name ?? "对方"}
+            onClose={() => setFeedbackDeal(null)}
+            onSubmit={(text) => submitFeedback(feedbackDeal, text)}
+          />
+        )}
+
         {/* ── 详情抽屉 ── */}
         {selected && (
           <PersonDrawer
@@ -1101,16 +1450,19 @@ export function NetworkDashboard() {
             onSave={(p) => {
               save({ ...store, people: store.people.map((x) => (x.id === p.id ? p : x)) });
             }}
+            onDealUpdate={markDealStatus}
+            onRecordFeedback={(deal) => setFeedbackDeal(deal)}
             onContact={markContacted}
             onSnooze={snooze}
             onCopy={copyScript}
             copied={copied === selected.id}
+            onDelete={deletePerson}
           />
         )}
 
         {/* Toast */}
         {toast && (
-          <div className="fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-xl border border-white/10 bg-white/10 px-4 py-2 text-sm text-white shadow-xl backdrop-blur-xl">
+          <div className="fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.12] px-4 py-2 text-sm text-[#0d3b39] shadow-xl backdrop-blur-xl">
             {toast}
           </div>
         )}
@@ -1254,27 +1606,27 @@ function AddPersonModal({
   };
 
   return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm" onClick={onClose}>
-      <div className="max-h-[85vh] w-full max-w-md overflow-y-auto rounded-2xl border border-white/10 bg-[#111116] p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-[#0d3b39]/60 p-4 backdrop-blur-sm" onClick={onClose}>
+      <div className="max-h-[85vh] w-full max-w-md overflow-y-auto rounded-2xl border border-[#0ABAB5]/25 bg-white p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
         <h3 className="mb-1 text-lg font-semibold">添加人脉</h3>
-        <p className="mb-4 text-xs text-white/40">一句话描述，AI 帮你填好表单；也可以直接手动填</p>
+        <p className="mb-4 text-xs text-[#0d3b39]/65">一句话描述，AI 帮你填好表单；也可以直接手动填</p>
 
         {/* 一句话智能输入 */}
-        <div className="mb-4 rounded-xl border border-indigo-500/20 bg-indigo-500/[0.05] p-3">
+        <div className="mb-4 rounded-xl border border-[#0ABAB5]/25 bg-#08948F/[0.05] p-3">
           <textarea
             value={desc}
             onChange={(e) => setDesc(e.target.value)}
             rows={2}
             placeholder={"如：张三，极客公园的记者，上周在AI大会上认识，聊得不错"}
-            className="w-full resize-none rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none placeholder-white/25 focus:border-white/20"
+            className="w-full resize-none rounded-lg border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] px-3 py-2 text-sm outline-none placeholder-[#0d3b39]/55 focus:border-[#0ABAB5]/40"
           />
           <div className="mt-2 flex items-center justify-between">
-            <span className="text-[11px] text-white/25">{parsed ? "已解析 ✓ 表单已填好，可修改" : "AI 自动识别姓名、组织、职位、标签"}</span>
+            <span className="text-[11px] text-[#0d3b39]/55">{parsed ? "已解析 ✓ 表单已填好，可修改" : "AI 自动识别姓名、组织、职位、标签"}</span>
             <Button
               size="sm"
               onClick={runParse}
               disabled={!desc.trim() || parsing}
-              className="h-7 border-0 bg-indigo-500/30 px-3 text-xs text-indigo-100 hover:bg-indigo-500/50 disabled:opacity-30"
+              className="h-7 border-0 bg-[#0ABAB5]/25 px-3 text-xs text-[#08948F] hover:bg-#08948F/50 disabled:opacity-30"
             >
               {parsing ? (
                 <span className="size-3 animate-spin rounded-full border-2 border-white/30 border-t-white" />
@@ -1284,7 +1636,7 @@ function AddPersonModal({
               AI 识别
             </Button>
           </div>
-          {parseError && <p className="mt-2 rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-300">{parseError}</p>}
+          {parseError && <p className="mt-2 rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-600">{parseError}</p>}
         </div>
 
         <div className="space-y-3">
@@ -1292,13 +1644,13 @@ function AddPersonModal({
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder="姓名 / 昵称 *"
-            className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none placeholder-white/30 focus:border-white/20"
+            className="w-full rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] px-3 py-2 text-sm outline-none placeholder-[#0d3b39]/60 focus:border-[#0ABAB5]/40"
           />
           <div className="grid grid-cols-2 gap-2">
             <select
               value={orgId}
               onChange={(e) => { setOrgId(e.target.value); if (e.target.value) setNewOrgName(""); }}
-              className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none focus:border-white/20 [&>option]:bg-[#111116]"
+              className="w-full rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] px-3 py-2 text-sm outline-none focus:border-[#0ABAB5]/40 [&>option]:bg-white"
             >
               <option value="">{newOrgName.trim() ? `新建：${newOrgName.trim()}` : "无组织（独立个人）"}</option>
               {store.organizations.map((o) => <option key={o.id} value={o.id}>{o.name}</option>)}
@@ -1307,31 +1659,31 @@ function AddPersonModal({
               value={newOrgName}
               onChange={(e) => setNewOrgName(e.target.value)}
               placeholder="新组织名（可选）"
-              className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none placeholder-white/30 focus:border-white/20"
+              className="w-full rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] px-3 py-2 text-sm outline-none placeholder-[#0d3b39]/60 focus:border-[#0ABAB5]/40"
             />
           </div>
           <input
             value={title}
             onChange={(e) => setTitle(e.target.value)}
             placeholder="职位 / 身份"
-            className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none placeholder-white/30 focus:border-white/20"
+            className="w-full rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] px-3 py-2 text-sm outline-none placeholder-[#0d3b39]/60 focus:border-[#0ABAB5]/40"
           />
           <input
             value={whatTheyDo}
             onChange={(e) => setWhatTheyDo(e.target.value)}
             placeholder="他是干嘛的（AI 可识别）"
-            className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none placeholder-white/30 focus:border-white/20"
+            className="w-full rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] px-3 py-2 text-sm outline-none placeholder-[#0d3b39]/60 focus:border-[#0ABAB5]/40"
           />
 
           <div>
-            <label className="mb-1.5 block text-xs font-medium text-white/40">他是干嘛的（可多选）</label>
+            <label className="mb-1.5 block text-xs font-medium text-[#0d3b39]/65">他是干嘛的（可多选）</label>
             <div className="flex flex-wrap gap-1.5">
               {TAG_SUGGESTIONS.map((t) => (
                 <button
                   key={t}
                   onClick={() => toggleTag(t)}
                   className={`rounded-lg px-2 py-1 text-xs transition-all ${
-                    tags.includes(t) ? "bg-indigo-500/30 text-indigo-200" : "bg-white/5 text-white/40 hover:bg-white/10"
+                    tags.includes(t) ? "bg-[#0ABAB5]/25 text-[#08948F]" : "bg-[#0ABAB5]/[0.06] text-[#0d3b39]/85 hover:bg-[#0ABAB5]/[0.12]"
                   }`}
                 >
                   {t}
@@ -1343,7 +1695,7 @@ function AddPersonModal({
                 value={customTag}
                 onChange={(e) => setCustomTag(e.target.value)}
                 placeholder="自定义标签"
-                className="flex-1 rounded-xl border border-white/10 bg-white/5 px-3 py-1.5 text-xs outline-none placeholder-white/30 focus:border-white/20"
+                className="flex-1 rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] px-3 py-1.5 text-xs outline-none placeholder-[#0d3b39]/60 focus:border-[#0ABAB5]/40"
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && customTag.trim()) {
                     e.preventDefault();
@@ -1353,7 +1705,7 @@ function AddPersonModal({
                 }}
               />
               {tags.filter((t) => !TAG_SUGGESTIONS.includes(t)).map((t) => (
-                <span key={t} className="flex items-center gap-1 rounded-lg bg-indigo-500/30 px-2 py-1 text-xs text-indigo-200">
+                <span key={t} className="flex items-center gap-1 rounded-lg bg-[#0ABAB5]/25 px-2 py-1 text-xs text-[#08948F]">
                   {t}
                   <button onClick={() => setTags(tags.filter((x) => x !== t))}><X className="size-3" /></button>
                 </span>
@@ -1366,25 +1718,25 @@ function AddPersonModal({
               value={wechat}
               onChange={(e) => setWechat(e.target.value)}
               placeholder="微信号（可选）"
-              className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none placeholder-white/30 focus:border-white/20"
+              className="w-full rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] px-3 py-2 text-sm outline-none placeholder-[#0d3b39]/60 focus:border-[#0ABAB5]/40"
             />
             <input
               value={howMet}
               onChange={(e) => setHowMet(e.target.value)}
               placeholder="怎么认识的（AI 可识别）"
-              className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none placeholder-white/30 focus:border-white/20"
+              className="w-full rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] px-3 py-2 text-sm outline-none placeholder-[#0d3b39]/60 focus:border-[#0ABAB5]/40"
             />
           </div>
 
           <div>
-            <label className="mb-1.5 block text-xs font-medium text-white/40">阶段</label>
+            <label className="mb-1.5 block text-xs font-medium text-[#0d3b39]/65">阶段</label>
             <div className="flex gap-1.5">
               {(["潜在", "初步接触", "深度合作", "暂停"] as const).map((s) => (
                 <button
                   key={s}
                   onClick={() => setStage(s)}
                   className={`rounded-lg px-2.5 py-1 text-xs font-medium transition-all ${
-                    stage === s ? "bg-white/15 text-white" : "bg-white/5 text-white/40 hover:bg-white/10"
+                    stage === s ? "bg-[#0ABAB5]/[0.16] text-[#0d3b39]" : "bg-[#0ABAB5]/[0.06] text-[#0d3b39]/85 hover:bg-[#0ABAB5]/[0.12]"
                   }`}
                 >
                   {s}
@@ -1394,8 +1746,8 @@ function AddPersonModal({
           </div>
         </div>
         <div className="mt-5 flex gap-2">
-          <Button variant="ghost" onClick={onClose} className="flex-1 text-white/50 hover:bg-white/10 hover:text-white">取消</Button>
-          <Button onClick={submit} disabled={!canSave} className="flex-1 border-0 bg-white/10 text-white hover:bg-white/20 disabled:opacity-30">添加</Button>
+          <Button variant="ghost" onClick={onClose} className="flex-1 text-[#0d3b39]/75 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]">取消</Button>
+          <Button onClick={submit} disabled={!canSave} className="flex-1 border-0 bg-[#0ABAB5]/[0.12] text-[#0d3b39] hover:bg-[#0ABAB5]/[0.22] disabled:opacity-30">添加</Button>
         </div>
       </div>
     </div>
@@ -1522,17 +1874,17 @@ function BatchAddModal({
   const checkedCount = items.filter((x) => x.checked).length;
 
   return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm" onClick={onClose}>
-      <div className="max-h-[88vh] w-full max-w-xl overflow-y-auto rounded-2xl border border-white/10 bg-[#111116] p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-[#0d3b39]/60 p-4 backdrop-blur-sm" onClick={onClose}>
+      <div className="max-h-[88vh] w-full max-w-xl overflow-y-auto rounded-2xl border border-[#0ABAB5]/25 bg-white p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
         <h3 className="mb-1 text-lg font-semibold">批量录入人脉</h3>
-        <p className="mb-4 text-xs text-white/40">每行一个人，一句话描述就行，AI 批量识别并判断录入价值</p>
+        <p className="mb-4 text-xs text-[#0d3b39]/65">每行一个人，一句话描述就行，AI 批量识别并判断录入价值</p>
 
         {/* 录入标准 */}
-        <div className="mb-4 rounded-xl border border-white/10 bg-white/[0.03] p-3 text-[11px] leading-5 text-white/50">
-          <p className="mb-1 font-medium text-white/70">该不该录？不用纠结，按这三条：</p>
-          <p>· <span className="text-emerald-300">聊过具体的事</span>（合作、需求、能互相帮上忙）→ 值得，AI 会标为「初步接触」</p>
-          <p>· <span className="text-sky-300">同行业、六个月内大概率再碰到</span> → 值得，标为「潜在」</p>
-          <p>· <span className="text-white/40">只是寒暄/换微信/混脸熟</span> → 可以不录。组织已经在库里了，等真聊了再录</p>
+        <div className="mb-4 rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.04] p-3 text-[11px] leading-5 text-[#0d3b39]/75">
+          <p className="mb-1 font-medium text-[#0d3b39]/70">该不该录？不用纠结，按这三条：</p>
+          <p>· <span className="text-emerald-600">聊过具体的事</span>（合作、需求、能互相帮上忙）→ 值得，AI 会标为「初步接触」</p>
+          <p>· <span className="text-[#08948F]">同行业、六个月内大概率再碰到</span> → 值得，标为「潜在」</p>
+          <p>· <span className="text-[#0d3b39]/65">只是寒暄/换微信/混脸熟</span> → 可以不录。组织已经在库里了，等真聊了再录</p>
         </div>
 
         {!items.length ? (
@@ -1542,19 +1894,19 @@ function BatchAddModal({
               onChange={(e) => setText(e.target.value)}
               rows={8}
               placeholder={"每行一个人，例如：\n\n张伟，WaytoAGI的内容运营，上个月杭州AI聚会认识的\n李娜，Datawhale主理人，聊过课程共建\n小王，某创业公司的技术，活动上加的微信"}
-              className="w-full resize-none rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none placeholder-white/25 focus:border-white/20"
+              className="w-full resize-none rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] px-3 py-2 text-sm outline-none placeholder-[#0d3b39]/55 focus:border-[#0ABAB5]/40"
               autoFocus
             />
             <div className="mt-2 flex items-center justify-end">
-              <span className="text-xs text-white/25">{text.split("\n").filter((l) => l.trim()).length} 行</span>
+              <span className="text-xs text-[#0d3b39]/55">{text.split("\n").filter((l) => l.trim()).length} 行</span>
             </div>
-            {error && <p className="mt-3 rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</p>}
+            {error && <p className="mt-3 rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-600">{error}</p>}
             <div className="mt-4 flex gap-2">
-              <Button variant="ghost" onClick={onClose} className="flex-1 text-white/50 hover:bg-white/10 hover:text-white">取消</Button>
+              <Button variant="ghost" onClick={onClose} className="flex-1 text-[#0d3b39]/75 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]">取消</Button>
               <Button
                 onClick={runParse}
                 disabled={!text.trim() || parsing}
-                className="flex-1 border-0 bg-white/10 text-white hover:bg-white/20 disabled:opacity-30"
+                className="flex-1 border-0 bg-[#0ABAB5]/[0.12] text-[#0d3b39] hover:bg-[#0ABAB5]/[0.22] disabled:opacity-30"
               >
                 {parsing ? (
                   <>
@@ -1572,10 +1924,10 @@ function BatchAddModal({
         ) : (
           <>
             <div className="mb-3 flex items-center justify-between">
-              <p className="text-xs text-white/40">
+              <p className="text-xs text-[#0d3b39]/65">
                 识别出 {items.length} 人 · 已选 {checkedCount} 人入库（点击卡片可取消）
               </p>
-              <button onClick={() => setItems(items.map((x) => ({ ...x, checked: !x.checked })))} className="text-xs text-white/40 hover:text-white">
+              <button onClick={() => setItems(items.map((x) => ({ ...x, checked: !x.checked })))} className="text-xs text-[#0d3b39]/65 hover:text-[#0d3b39]">
                 全选/全不选
               </button>
             </div>
@@ -1587,39 +1939,39 @@ function BatchAddModal({
                     key={i}
                     onClick={() => setItems(items.map((y, j) => (j === i ? { ...y, checked: !y.checked } : y)))}
                     className={`flex w-full items-start gap-2.5 rounded-xl border p-3 text-left transition-all ${
-                      x.checked ? "border-white/15 bg-white/[0.05]" : "border-white/5 bg-white/[0.02] opacity-50"
+                      x.checked ? "border-[#0ABAB5]/30 bg-white/[0.05]" : "border-[#0ABAB5]/15 bg-[#0ABAB5]/[0.03] opacity-50"
                     }`}
                   >
                     <div className="flex size-5 shrink-0 items-center justify-center rounded-md border" style={{
                       borderColor: x.checked ? "#6366f1" : "rgba(255,255,255,0.15)",
                       backgroundColor: x.checked ? "#6366f1" : "transparent",
                     }}>
-                      {x.checked && <Check className="size-3.5 text-white" />}
+                      {x.checked && <Check className="size-3.5 text-[#0d3b39]" />}
                     </div>
                     <div className="min-w-0 flex-1">
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="text-sm font-medium">{x.name}</span>
                         {x.exists && (
-                          <span className="rounded-full bg-amber-500/20 px-1.5 py-0.5 text-[10px] text-amber-300">人脉库已有（默认跳过）</span>
+                          <span className="rounded-full bg-amber-500/20 px-1.5 py-0.5 text-[10px] text-amber-600">人脉库已有（默认跳过）</span>
                         )}
                         <span className="rounded-full px-1.5 py-0.5 text-[10px]" style={{ backgroundColor: badge.bg, color: badge.text }}>
                           {badge.label} · {x.stage}
                         </span>
                       </div>
-                      <p className="mt-0.5 truncate text-xs text-white/40">
+                      <p className="mt-0.5 truncate text-xs text-[#0d3b39]/65">
                         {[x.title, x.org].filter(Boolean).join(" · ") || "身份未知"}
                         {x.howMet ? ` · ${x.howMet}` : ""}
                       </p>
-                      {x.reason && <p className="mt-1 text-[11px] leading-4 text-white/35">{x.reason}</p>}
+                      {x.reason && <p className="mt-1 text-[11px] leading-4 text-[#0d3b39]/65">{x.reason}</p>}
                     </div>
                   </button>
                 );
               })}
             </div>
-            {error && <p className="mt-3 rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</p>}
+            {error && <p className="mt-3 rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-600">{error}</p>}
             <div className="mt-4 flex gap-2">
-              <Button variant="ghost" onClick={() => setItems([])} className="text-white/50 hover:bg-white/10 hover:text-white">重新粘贴</Button>
-              <Button onClick={submit} disabled={!checkedCount} className="flex-1 border-0 bg-white/10 text-white hover:bg-white/20 disabled:opacity-30">
+              <Button variant="ghost" onClick={() => setItems([])} className="text-[#0d3b39]/75 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]">重新粘贴</Button>
+              <Button onClick={submit} disabled={!checkedCount} className="flex-1 border-0 bg-[#0ABAB5]/[0.12] text-[#0d3b39] hover:bg-[#0ABAB5]/[0.22] disabled:opacity-30">
                 <Check className="size-4" /> 保存 {checkedCount} 人入库
               </Button>
             </div>
@@ -1633,7 +1985,7 @@ function BatchAddModal({
 // ─── 人脉详情抽屉（可编辑）───
 
 function PersonDrawer({
-  person: initial, org, store, onClose, onSave, onContact, onSnooze, onCopy, copied,
+  person: initial, org, store, onClose, onSave, onContact, onSnooze, onCopy, copied, onDealUpdate, onDelete, onRecordFeedback,
 }: {
   person: Person;
   org?: Organization;
@@ -1644,6 +1996,9 @@ function PersonDrawer({
   onSnooze: (p: Person, days: number) => void;
   onCopy: (p: Person) => void;
   copied: boolean;
+  onDealUpdate?: (deal: Deal, status: DealStatus) => void;
+  onDelete: (p: Person) => void;
+  onRecordFeedback?: (deal: Deal) => void;
 }) {
   const [p, setP] = useState<Person>(initial);
   const [draft, setDraft] = useState<Person>(initial);
@@ -1654,6 +2009,7 @@ function PersonDrawer({
   const [aiHint, setAiHint] = useState("");
   const [guideBusy, setGuideBusy] = useState(false);
   const [guide, setGuide] = useState<{ questions?: string[]; focus?: string } | null>(null);
+  const [personResearchBusy, setPersonResearchBusy] = useState(false);
   const orgColor = org ? CATEGORY_COLORS[org.category] : "#6366f1";
 
   useEffect(() => {
@@ -1687,6 +2043,53 @@ function PersonDrawer({
     setDraft(p);
     setEditing(false);
     setEditingField(null);
+  };
+
+  // 联网补背景：搜这个人+组织的公开资料，结果追加进备注（旧内容保留）
+  const runPersonResearch = async () => {
+    if (personResearchBusy) return;
+    setPersonResearchBusy(true);
+    try {
+      const r = await fetch("/api/network/research-person", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: p.name,
+          org: org?.name ?? null,
+          context: [p.whatTheyDo, p.cooperation].filter(Boolean).join("；").slice(0, 400),
+        }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error ?? "检索失败");
+      const res = d.result as PersonResearch;
+      if (!res?.found) {
+        setAiHint("联网没找到可靠资料（公开信息太少或重名太多），等聊过后再补");
+        return;
+      }
+      const today = localToday();
+      const blocks = [
+        `🌐 联网检索 · ${today}`,
+        res.background ?? "",
+        ...(res.keyPoints ?? []).map((k) => `· ${k}`),
+        ...(res.socialLinks ?? []).length ? [`主页：${res.socialLinks.join("、")}`] : [],
+        res.businessMatch?.matchedBusiness ? `业务匹配：${res.businessMatch.matchedBusiness} — ${res.businessMatch.suggestion}` : "",
+        res.sources?.length ? `来源：${res.sources.slice(0, 3).join("、")}` : "",
+      ].filter(Boolean);
+      const existingPerson = p;
+      const next: Person = {
+        ...existingPerson,
+        title: existingPerson.title ?? res.title ?? undefined,
+        cooperation: existingPerson.cooperation ?? res.cooperation ?? undefined,
+        notes: [existingPerson.notes, blocks.join("\n")].filter(Boolean).join("\n\n"),
+        updatedAt: today,
+      };
+      commitPatch(next);
+      setAiHint(`已把「${p.name}」的公开背景写进备注（来源 ${res.sources?.length ?? 0} 条）`);
+    } catch (e) {
+      setAiHint(e instanceof Error ? e.message : "检索失败");
+    } finally {
+      setPersonResearchBusy(false);
+    }
   };
 
   // AI 引导式追问：针对空缺维度生成下一步该问什么/回忆什么
@@ -1789,7 +2192,7 @@ function PersonDrawer({
     const active = editing || editingField === field;
     return (
       <div>
-        <label className="text-xs font-medium text-white/40">{label}</label>
+        <label className="text-xs font-medium text-[#0d3b39]/65">{label}</label>
         {active ? (
           multiline ? (
             <textarea
@@ -1798,7 +2201,7 @@ function PersonDrawer({
               rows={2}
               onChange={(e) => update({ [field]: e.target.value } as Partial<Person>)}
               onFocus={() => setEditingField(field)}
-              className="mt-1 w-full resize-none rounded-xl border border-white/20 bg-white/5 px-3 py-2 text-sm outline-none"
+              className="mt-1 w-full resize-none rounded-xl border border-[#0ABAB5]/40 bg-[#0ABAB5]/[0.06] px-3 py-2 text-sm outline-none"
             />
           ) : (
             <input
@@ -1807,12 +2210,12 @@ function PersonDrawer({
               onChange={(e) => update({ [field]: e.target.value } as Partial<Person>)}
               onFocus={() => setEditingField(field)}
               onKeyDown={(e) => e.key === "Enter" && !multiline && setEditingField(null)}
-              className="mt-1 w-full rounded-xl border border-white/20 bg-white/5 px-3 py-2 text-sm outline-none"
+              className="mt-1 w-full rounded-xl border border-[#0ABAB5]/40 bg-[#0ABAB5]/[0.06] px-3 py-2 text-sm outline-none"
             />
           )
         ) : (
-          <button onClick={() => { setEditing(true); setEditingField(field); }} className="mt-1 w-full rounded-xl bg-white/[0.04] px-3 py-2 text-left text-sm text-white/80 transition-colors hover:bg-white/[0.08]">
-            {value || <span className="text-white/25">{placeholder}</span>}
+          <button onClick={() => { setEditing(true); setEditingField(field); }} className="mt-1 w-full rounded-xl bg-[#0ABAB5]/[0.06] px-3 py-2 text-left text-sm text-[#0d3b39]/80 transition-colors hover:bg-[#0ABAB5]/[0.10]">
+            {value || <span className="text-[#0d3b39]/55">{placeholder}</span>}
           </button>
         )}
       </div>
@@ -1820,15 +2223,18 @@ function PersonDrawer({
   };
 
   return (
-    <aside className="fixed inset-y-0 right-0 z-30 w-full max-w-md overflow-y-auto border-l border-white/10 bg-[#111116]/95 p-6 shadow-2xl backdrop-blur-2xl">
+    <aside className="fixed inset-y-0 right-0 z-30 w-full max-w-md overflow-y-auto border-l border-[#0ABAB5]/25 bg-white/95 p-6 shadow-2xl backdrop-blur-2xl">
       <div className="flex items-start justify-between">
         <div className="flex items-center gap-3">
           <div className="flex size-12 items-center justify-center rounded-xl text-lg font-semibold" style={{ backgroundColor: orgColor + "20", color: orgColor }}>
             {p.name.charAt(0)}
           </div>
           <div>
-            <h2 className="text-xl font-semibold">{p.name}</h2>
-            <p className="text-sm text-white/40">
+            <div className="flex items-center gap-2">
+              <h2 className="text-xl font-semibold">{p.name}</h2>
+              <Stars n={starsOf(p, store)} className="text-sm" />
+            </div>
+            <p className="text-sm text-[#0d3b39]/65">
               {p.title ? `${p.title}` : ""}
               {org ? `${p.title ? " · " : ""}${org.name}` : p.title ? "" : "独立个人"}
             </p>
@@ -1836,16 +2242,16 @@ function PersonDrawer({
         </div>
         <div className="flex items-center gap-1">
           {!editing ? (
-            <Button variant="ghost" size="sm" onClick={() => setEditing(true)} className="text-xs text-white/50 hover:bg-white/10 hover:text-white">
+            <Button variant="ghost" size="sm" onClick={() => setEditing(true)} className="text-xs text-[#0d3b39]/75 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]">
               编辑资料
             </Button>
           ) : (
             <>
-              <Button variant="ghost" size="sm" onClick={cancelChanges} className="text-xs text-white/50 hover:bg-white/10 hover:text-white">取消</Button>
-              <Button size="sm" onClick={saveChanges} className="border-0 bg-indigo-500/25 text-xs text-indigo-100 hover:bg-indigo-500/40">保存修改</Button>
+              <Button variant="ghost" size="sm" onClick={cancelChanges} className="text-xs text-[#0d3b39]/75 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]">取消</Button>
+              <Button size="sm" onClick={saveChanges} className="border-0 bg-[#0ABAB5]/20 text-xs text-[#08948F] hover:bg-#08948F/40">保存修改</Button>
             </>
           )}
-          <Button variant="ghost" size="icon" onClick={onClose} className="text-white/40 hover:bg-white/10 hover:text-white">
+          <Button variant="ghost" size="icon" onClick={onClose} className="text-[#0d3b39]/65 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]">
             <X className="size-5" />
           </Button>
         </div>
@@ -1864,7 +2270,7 @@ function PersonDrawer({
       <div className="mt-4">
         <div className="flex flex-wrap gap-1.5">
           {draft.tags.map((t) => (
-            <span key={t} className="group flex items-center gap-1 rounded-lg bg-indigo-500/20 px-2 py-1 text-xs text-indigo-200">
+            <span key={t} className="group flex items-center gap-1 rounded-lg bg-[#0ABAB5]/15 px-2 py-1 text-xs text-[#08948F]">
               {t}
               {editing && <button onClick={() => update({ tags: draft.tags.filter((x) => x !== t) })} className="opacity-40 hover:opacity-100">
                 <X className="size-3" />
@@ -1883,7 +2289,7 @@ function PersonDrawer({
                 }
               }}
               placeholder={editing ? "+ 标签" : "点击编辑后添加"}
-              className="w-28 rounded-lg bg-white/5 px-2 py-1 text-xs outline-none placeholder-white/25 focus:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+              className="w-28 rounded-lg bg-[#0ABAB5]/[0.06] px-2 py-1 text-xs outline-none placeholder-[#0d3b39]/55 focus:bg-[#0ABAB5]/[0.12] disabled:cursor-not-allowed disabled:opacity-50"
             />
           </div>
         </div>
@@ -1891,14 +2297,14 @@ function PersonDrawer({
 
       {/* 阶段 */}
       <div className="mt-5">
-        <label className="text-xs font-medium text-white/40">阶段</label>
+        <label className="text-xs font-medium text-[#0d3b39]/65">阶段</label>
         <div className="mt-1.5 flex gap-1.5">
           {(["潜在", "初步接触", "深度合作", "暂停"] as const).map((s) => (
             <button
               key={s}
               onClick={() => editing && update({ stage: s })}
               className={`rounded-lg px-2.5 py-1 text-xs font-medium transition-all ${
-                draft.stage === s ? "bg-white/15 text-white" : "bg-white/5 text-white/40 hover:bg-white/10"
+                draft.stage === s ? "bg-[#0ABAB5]/[0.16] text-[#0d3b39]" : "bg-[#0ABAB5]/[0.06] text-[#0d3b39]/85 hover:bg-[#0ABAB5]/[0.12]"
               } ${!editing ? "cursor-default opacity-70" : ""}`}
             >
               {s}
@@ -1909,7 +2315,7 @@ function PersonDrawer({
 
       {/* AI 结果提示 */}
       {aiHint && !aiBusy && (
-        <div className="mt-4 rounded-xl border border-indigo-500/20 bg-indigo-500/[0.06] px-3 py-2 text-xs text-indigo-200/80">
+        <div className="mt-4 rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] px-3 py-2 text-xs text-[#08948F]/80">
           {aiHint}
         </div>
       )}
@@ -1917,14 +2323,14 @@ function PersonDrawer({
       {/* 详细信息（点击即编辑 + AI 补全） */}
       <div className="mt-5">
         <div className="mb-2 flex items-center justify-between">
-          <label className="text-xs font-medium text-white/40">详细信息</label>
+          <label className="text-xs font-medium text-[#0d3b39]/65">详细信息</label>
           <button
             onClick={runSuggest}
             disabled={!!aiBusy}
-            className="flex items-center gap-1 rounded-lg bg-indigo-500/20 px-2 py-1 text-[11px] text-indigo-200 transition-colors hover:bg-indigo-500/30 disabled:opacity-40"
+            className="flex items-center gap-1 rounded-lg bg-[#0ABAB5]/15 px-2 py-1 text-[11px] text-[#08948F] transition-colors hover:bg-[#0ABAB5]/25 disabled:opacity-40"
           >
             {aiBusy === "suggest" ? (
-              <span className="size-3 animate-spin rounded-full border-2 border-indigo-300/30 border-t-indigo-300" />
+              <span className="size-3 animate-spin rounded-full border-2 border-#08948F/30 border-t-#08948F" />
             ) : (
               <Sparkles className="size-3" />
             )}
@@ -1941,12 +2347,12 @@ function PersonDrawer({
           <EditableField field="notes" label="备注" placeholder="点击填写" multiline />
           <div className="grid grid-cols-2 gap-2">
             <div>
-              <label className="text-xs font-medium text-white/40">优先级</label>
+              <label className="text-xs font-medium text-[#0d3b39]/65">优先级</label>
               <select
                 value={draft.priority}
                 disabled={!editing}
                 onChange={(e) => update({ priority: e.target.value as Priority })}
-                className="mt-1 w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none disabled:opacity-60 [&>option]:bg-[#111116]"
+                className="mt-1 w-full rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] px-3 py-2 text-sm outline-none disabled:opacity-60 [&>option]:bg-white"
               >
                 <option value="high">高</option>
                 <option value="medium">中</option>
@@ -1954,13 +2360,13 @@ function PersonDrawer({
               </select>
             </div>
             <div>
-              <label className="text-xs font-medium text-white/40">下次跟进</label>
+              <label className="text-xs font-medium text-[#0d3b39]/65">下次跟进</label>
               <input
                 type="date"
                 value={draft.nextFollowUpDate ?? ""}
                 disabled={!editing}
                 onChange={(e) => update({ nextFollowUpDate: e.target.value || undefined })}
-                className="mt-1 w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none disabled:opacity-60"
+                className="mt-1 w-full rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] px-3 py-2 text-sm outline-none disabled:opacity-60"
               />
             </div>
           </div>
@@ -1968,7 +2374,7 @@ function PersonDrawer({
       </div>
 
       {/* 档案完整度 + AI 引导追问（防止漏掉关键信息） */}
-      <div className="mt-5 rounded-xl border border-white/10 bg-white/[0.03] p-3.5">
+      <div className="mt-5 rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.04] p-3.5">
         {(() => {
           const dims = GUIDE_DIMS.map((d) => ({
             ...d,
@@ -1978,17 +2384,28 @@ function PersonDrawer({
           return (
             <>
               <div className="flex items-center justify-between">
-                <span className="text-xs font-medium text-white/40">档案完整度 {done}/{dims.length}</span>
-                <button
-                  onClick={runGuideQuestions}
-                  disabled={guideBusy}
-                  className="flex items-center gap-1 rounded-lg bg-fuchsia-500/20 px-2 py-1 text-[11px] text-fuchsia-200 transition-colors hover:bg-fuchsia-500/30 disabled:opacity-40"
-                >
-                  {guideBusy ? <span className="size-3 animate-spin rounded-full border-2 border-fuchsia-300/30 border-t-fuchsia-300" /> : <Sparkles className="size-3" />}
-                  AI 给我列追问
-                </button>
+                <span className="text-xs font-medium text-[#0d3b39]/65">档案完整度 {done}/{dims.length}</span>
+                <div className="flex gap-1.5">
+                  <button
+                    onClick={runPersonResearch}
+                    disabled={personResearchBusy}
+                    className="flex items-center gap-1 rounded-lg bg-[#08948F]/15 px-2 py-1 text-[11px] text-[#08948F] transition-colors hover:bg-[#08948F]/25 disabled:opacity-40"
+                    title="联网搜索这个人的公开背景，自动写进备注"
+                  >
+                    {personResearchBusy ? <span className="size-3 animate-spin rounded-full border-2 border-#08948F/30 border-t-#08948F" /> : <ScanText className="size-3" />}
+                    联网补背景
+                  </button>
+                  <button
+                    onClick={runGuideQuestions}
+                    disabled={guideBusy}
+                    className="flex items-center gap-1 rounded-lg bg-[#0ABAB5]/15 px-2 py-1 text-[11px] text-[#08948F] transition-colors hover:bg-[#0ABAB5]/25 disabled:opacity-40"
+                  >
+                    {guideBusy ? <span className="size-3 animate-spin rounded-full border-2 border-[#0ABAB5]/40 border-t-#08948F" /> : <Sparkles className="size-3" />}
+                    AI 给我列追问
+                  </button>
+                </div>
               </div>
-              <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white/5">
+              <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-[#0ABAB5]/[0.06]">
                 <div className="h-full rounded-full bg-gradient-to-r from-emerald-500/60 to-emerald-400/80 transition-all" style={{ width: `${Math.round((done / dims.length) * 100)}%` }} />
               </div>
               <div className="mt-2.5 flex flex-wrap gap-1.5">
@@ -1996,19 +2413,19 @@ function PersonDrawer({
                   <button
                     key={d.field}
                     onClick={() => { setEditing(true); setEditingField(d.field === "tags" ? null : d.field); }}
-                    className={`rounded-full px-2 py-0.5 text-[11px] transition-colors ${d.filled ? "bg-emerald-500/15 text-emerald-300/80" : "bg-white/5 text-white/30 hover:bg-white/10 hover:text-white/60"}`}
+                    className={`rounded-full px-2 py-0.5 text-[11px] transition-colors ${d.filled ? "bg-emerald-500/15 text-emerald-600/80" : "bg-[#0ABAB5]/[0.06] text-[#0d3b39]/60 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]/85"}`}
                   >
                     {d.filled ? "✓ " : ""}{d.label}
                   </button>
                 ))}
               </div>
               {guide && (
-                <div className="mt-3 space-y-1.5 border-t border-white/5 pt-3">
-                  {guide.focus && <p className="text-[11px] font-medium text-fuchsia-200/80">📌 {guide.focus}</p>}
+                <div className="mt-3 space-y-1.5 border-t border-[#0ABAB5]/15 pt-3">
+                  {guide.focus && <p className="text-[11px] font-medium text-[#08948F]/80">📌 {guide.focus}</p>}
                   {(guide.questions ?? []).map((q, i) => (
-                    <p key={i} className="rounded-lg bg-white/[0.04] px-2.5 py-1.5 text-xs leading-5 text-white/60">{i + 1}. {q}</p>
+                    <p key={i} className="rounded-lg bg-[#0ABAB5]/[0.06] px-2.5 py-1.5 text-xs leading-5 text-[#0d3b39]/85">{i + 1}. {q}</p>
                   ))}
-                  <p className="text-[10px] text-white/25">下次聊之前看一眼；答案点上方对应的灰色标签直接补进去</p>
+                  <p className="text-[10px] text-[#0d3b39]/70">下次聊之前看一眼；答案点上方对应的灰色标签直接补进去</p>
                 </div>
               )}
             </>
@@ -2034,27 +2451,68 @@ function PersonDrawer({
         />
       </div>
 
+      {/* 合作事项：推进中的 + 已达成待反馈的 */}
+      {(store.deals ?? []).filter((d) => d.personId === p.id && (d.status === "推进中" || d.status === "达成" || d.isFollowUpVisit)).length > 0 && (
+        <div className="mt-5">
+          <label className="text-xs font-medium text-[#0d3b39]/65">合作事项</label>
+          <div className="mt-1.5 space-y-1.5">
+            {(store.deals ?? []).filter((d) => d.personId === p.id && (d.status === "推进中" || d.status === "达成" || d.isFollowUpVisit)).map((d) => {
+              const over = d.nextFollowUpDate ? (daysSince(d.nextFollowUpDate) ?? 0) >= 0 : false;
+              return (
+                <div key={d.id} className={`rounded-lg border p-2.5 ${over ? "border-orange-500/25 bg-orange-500/[0.06]" : "border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.04]"}`}>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="min-w-0 truncate text-xs font-medium text-[#0d3b39]/80">{d.isFollowUpVisit ? "🔄" : d.status === "达成" ? "🎉" : "📋"} {d.title}</span>
+                    {d.status === "推进中" ? (
+                      <button
+                        onClick={() => onDealUpdate?.(d, "达成")}
+                        className="shrink-0 rounded-lg bg-emerald-500/15 px-1.5 py-0.5 text-[10px] text-emerald-600 hover:bg-emerald-500/25"
+                      >
+                        达成
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => onRecordFeedback?.(d)}
+                        className="shrink-0 rounded-lg bg-[#08948F]/12 px-1.5 py-0.5 text-[10px] text-[#08948F] hover:bg-[#08948F]/20"
+                      >
+                        {d.feedback ? "补充反馈" : "记录反馈"}
+                      </button>
+                    )}
+                  </div>
+                  {d.nextStep && d.status === "推进中" && <p className="mt-0.5 text-[11px] text-[#0d3b39]/70">下一步：{d.nextStep}</p>}
+                  {d.feedback && <p className="mt-0.5 whitespace-pre-line text-[11px] leading-4 text-[#0d3b39]/70">🤝 {d.feedback}</p>}
+                  {d.status === "推进中" && (
+                    <p className={`mt-0.5 text-[10px] ${over ? "text-orange-600" : "text-[#0d3b39]/60"}`}>
+                      {d.nextFollowUpDate ? (over ? `该跟进了（${d.nextFollowUpDate}）` : `${d.nextFollowUpDate} 跟进`) : "无跟进计划"}
+                    </p>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {/* 联系状态 */}
       <div className="mt-5">
-        <label className="text-xs font-medium text-white/40">联系状态</label>
+        <label className="text-xs font-medium text-[#0d3b39]/65">联系状态</label>
         <p className="mt-1 text-sm">
           {p.lastContactDate ? `${days} 天前联系过` : "还没联系过"}
         </p>
         {p.nextFollowUpDate && (
-          <p className="mt-0.5 text-xs text-white/30">下次跟进：{p.nextFollowUpDate}</p>
+          <p className="mt-0.5 text-xs text-[#0d3b39]/60">下次跟进：{p.nextFollowUpDate}</p>
         )}
       </div>
 
       {/* 话术 */}
       <div className="mt-5">
         <div className="mb-1.5 flex items-center justify-between">
-          <label className="text-xs font-medium text-white/40">
+          <label className="text-xs font-medium text-[#0d3b39]/65">
             建议话术{p.aiReply ? " · AI 定制" : ""}
           </label>
           <button
             onClick={runScript}
             disabled={!!aiBusy}
-            className="flex items-center gap-1 rounded-lg bg-emerald-500/20 px-2 py-1 text-[11px] text-emerald-200 transition-colors hover:bg-emerald-500/30 disabled:opacity-40"
+            className="flex items-center gap-1 rounded-lg bg-emerald-500/20 px-2 py-1 text-[11px] text-emerald-700 transition-colors hover:bg-emerald-500/30 disabled:opacity-40"
           >
             {aiBusy === "script" ? (
               <span className="size-3 animate-spin rounded-full border-2 border-emerald-300/30 border-t-emerald-300" />
@@ -2064,10 +2522,10 @@ function PersonDrawer({
             {p.aiReply ? "重新生成" : "AI 定制话术"}
           </button>
         </div>
-        <div className="mt-1.5 rounded-xl bg-white/[0.04] p-3 text-xs leading-5 text-white/60">
+        <div className="mt-1.5 rounded-xl bg-[#0ABAB5]/[0.06] p-3 text-xs leading-5 text-[#0d3b39]/85">
           {generateScript(p, org)}
         </div>
-        <Button size="sm" variant="ghost" onClick={() => onCopy(p)} className="mt-2 h-7 px-2 text-xs text-white/50 hover:bg-white/10 hover:text-white">
+        <Button size="sm" variant="ghost" onClick={() => onCopy(p)} className="mt-2 h-7 px-2 text-xs text-[#0d3b39]/75 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]">
           {copied ? <Check className="size-3" /> : <Copy className="size-3" />}
           <span className="ml-1">{copied ? "已复制" : "复制话术"}</span>
         </Button>
@@ -2076,15 +2534,15 @@ function PersonDrawer({
       {/* 互动历史 */}
       {ints.length > 0 && (
         <div className="mt-5">
-          <label className="text-xs font-medium text-white/40">互动记录（{ints.length}）</label>
+          <label className="text-xs font-medium text-[#0d3b39]/65">互动记录（{ints.length}）</label>
           <div className="mt-1.5 space-y-2">
             {ints.slice(-5).reverse().map((i) => (
-              <div key={i.id} className="rounded-lg bg-white/[0.04] p-2.5 text-xs">
-                <div className="flex justify-between text-white/30">
+              <div key={i.id} className="rounded-lg bg-[#0ABAB5]/[0.06] p-2.5 text-xs">
+                <div className="flex justify-between text-[#0d3b39]/60">
                   <span>{i.date}</span>
                   <span>{i.channel}</span>
                 </div>
-                <p className="mt-1 text-white/60">{i.summary}</p>
+                <p className="mt-1 text-[#0d3b39]/85">{i.summary}</p>
               </div>
             ))}
           </div>
@@ -2093,11 +2551,22 @@ function PersonDrawer({
 
       {/* 操作 */}
       <div className="mt-6 flex gap-2 pb-4">
-        <Button onClick={() => onContact(p)} className="flex-1 border-0 bg-white/10 text-white hover:bg-white/20">
+        <Button onClick={() => onContact(p)} className="flex-1 border-0 bg-[#0ABAB5]/[0.12] text-[#0d3b39] hover:bg-[#0ABAB5]/[0.22]">
           <MessageCircle className="size-4" /> 已联系
         </Button>
-        <Button variant="ghost" onClick={() => onSnooze(p, 7)} className="text-white/50 hover:bg-white/10 hover:text-white">
+        <Button variant="ghost" onClick={() => onSnooze(p, 7)} className="text-[#0d3b39]/75 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]">
           延后7天
+        </Button>
+      </div>
+
+      {/* 删除：连带互动记录与合作事项一起清掉 */}
+      <div className="border-t border-[#0ABAB5]/15 pt-3 pb-6">
+        <Button
+          variant="ghost"
+          onClick={() => { if (window.confirm(`确定删除「${p.name}」吗？互动记录和进行中的合作事项会一起删除。`)) onDelete(p); }}
+          className="w-full text-xs text-[#0d3b39]/60 hover:bg-red-500/15 hover:text-red-600"
+        >
+          删除此人脉
         </Button>
       </div>
     </aside>
@@ -2154,22 +2623,22 @@ function LinkEnrichCard({
 
   return (
     <div>
-      <label className="text-xs font-medium text-white/40">链接画像</label>
-      <p className="mt-0.5 text-[11px] text-white/25">贴他的主页/文章/组织官网，AI 抓取后补充上下文</p>
+      <label className="text-xs font-medium text-[#0d3b39]/65">链接画像</label>
+      <p className="mt-0.5 text-[11px] text-[#0d3b39]/55">贴他的主页/文章/组织官网，AI 抓取后补充上下文</p>
       <div className="mt-1.5 flex gap-1.5">
         <input
           value={url}
           onChange={(e) => setUrl(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && run()}
           placeholder="https://…"
-          className="flex-1 rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs outline-none placeholder-white/25 focus:border-white/20"
+          className="flex-1 rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] px-3 py-2 text-xs outline-none placeholder-[#0d3b39]/55 focus:border-[#0ABAB5]/40"
         />
         <Button
           size="sm"
           variant="ghost"
           onClick={run}
           disabled={busy || !url.trim()}
-          className="h-8 shrink-0 px-2.5 text-xs text-white/50 hover:bg-white/10 hover:text-white disabled:opacity-30"
+          className="h-8 shrink-0 px-2.5 text-xs text-[#0d3b39]/75 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39] disabled:opacity-30"
         >
           {busy ? (
             <span className="size-3 animate-spin rounded-full border-2 border-white/30 border-t-white" />
@@ -2179,15 +2648,15 @@ function LinkEnrichCard({
           抓取
         </Button>
       </div>
-      {error && <p className="mt-2 rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</p>}
+      {error && <p className="mt-2 rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-600">{error}</p>}
       {info && (
-        <div className="mt-2 rounded-xl border border-sky-500/20 bg-sky-500/[0.06] p-3">
-          <p className="text-xs leading-5 text-white/75">{info.result.summary}</p>
+        <div className="mt-2 rounded-xl border border-[#08948F]/25 bg-[#08948F]/[0.06] p-3">
+          <p className="text-xs leading-5 text-[#0d3b39]/75">{info.result.summary}</p>
           {info.result.keyPoints.length > 0 && (
             <ul className="mt-2 space-y-1">
               {info.result.keyPoints.map((k, i) => (
-                <li key={i} className="flex gap-1.5 text-[11px] leading-4 text-white/50">
-                  <span className="text-sky-300/60">·</span>
+                <li key={i} className="flex gap-1.5 text-[11px] leading-4 text-[#0d3b39]/75">
+                  <span className="text-[#08948F]/60">·</span>
                   {k}
                 </li>
               ))}
@@ -2195,22 +2664,22 @@ function LinkEnrichCard({
           )}
           {info.result.businessMatch?.matchedBusiness && (
             <div className="mt-2 rounded-lg bg-amber-500/10 px-2.5 py-1.5">
-              <p className="text-[11px] text-amber-300">🎯 业务匹配：{info.result.businessMatch.matchedBusiness}</p>
-              <p className="mt-0.5 text-[11px] text-white/60">{info.result.businessMatch.suggestion}</p>
+              <p className="text-[11px] text-amber-600">🎯 业务匹配：{info.result.businessMatch.matchedBusiness}</p>
+              <p className="mt-0.5 text-[11px] text-[#0d3b39]/85">{info.result.businessMatch.suggestion}</p>
             </div>
           )}
           {info.result.cooperation && (
-            <p className="mt-2 text-[11px] leading-4 text-sky-200/80">合作切入：{info.result.cooperation}</p>
+            <p className="mt-2 text-[11px] leading-4 text-[#08948F]/80">合作切入：{info.result.cooperation}</p>
           )}
           <div className="mt-2.5 flex gap-2">
-            <Button size="sm" variant="ghost" onClick={() => onMerge(info.result, info.url)} className="h-7 px-2 text-xs text-sky-300 hover:bg-white/10">
+            <Button size="sm" variant="ghost" onClick={() => onMerge(info.result, info.url)} className="h-7 px-2 text-xs text-[#08948F] hover:bg-[#0ABAB5]/[0.12]">
               <Check className="size-3" /> 并入资料
             </Button>
             <Button
               size="sm"
               variant="ghost"
               onClick={() => navigator.clipboard.writeText(`${info.result.summary}\n${info.result.keyPoints.map((k) => `· ${k}`).join("\n")}`)}
-              className="h-7 px-2 text-xs text-white/40 hover:bg-white/10 hover:text-white"
+              className="h-7 px-2 text-xs text-[#0d3b39]/65 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]"
             >
               <Copy className="size-3" /> 复制
             </Button>
@@ -2343,6 +2812,7 @@ function ImportChatModal({
 
   const save = () => {
     if (!result) return;
+    if (isSelfName(result.person.name)) { setError("识别到的是你自己（沈佳颖），不能作为人脉录入"); return; }
     const org = store.organizations.find(
       (o) => o.name === (result.person.org ?? "").trim() || o.name.includes((result.person.org ?? "\u0000").trim()),
     );
@@ -2454,30 +2924,30 @@ function ImportChatModal({
   const intentColor = result ? INTENT_COLORS[result.intent.category] ?? "#6b7280" : "#6b7280";
 
   return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm" onClick={onClose}>
-      <div className="max-h-[88vh] w-full max-w-xl overflow-y-auto rounded-2xl border border-white/10 bg-[#111116] p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-[#0d3b39]/60 p-4 backdrop-blur-sm" onClick={onClose}>
+      <div className="max-h-[88vh] w-full max-w-xl overflow-y-auto rounded-2xl border border-[#0ABAB5]/25 bg-white p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
         {!result ? (
           <>
             <h3 className="mb-1 text-lg font-semibold">粘贴聊天记录</h3>
-            <p className="mb-4 text-xs text-white/40">从微信多选消息复制，直接粘贴进来。AI 自动识别对方是谁、想要什么、怎么回。</p>
+            <p className="mb-4 text-xs text-[#0d3b39]/65">从微信多选消息复制，直接粘贴进来。AI 自动识别对方是谁、想要什么、怎么回。</p>
             <textarea
               value={text}
               onChange={(e) => setText(e.target.value)}
               rows={10}
               placeholder={"示例（微信复制格式）：\n\n张三\n2026-09-20 14:32\n你好，我们下个月有个开发者活动，想邀请你们参与\n\n我\n2026-09-20 14:40\n好啊，具体什么形式？"}
-              className="w-full resize-none rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none placeholder-white/25 focus:border-white/20"
+              className="w-full resize-none rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] px-3 py-2 text-sm outline-none placeholder-[#0d3b39]/55 focus:border-[#0ABAB5]/40"
               autoFocus
             />
             <div className="mt-3 flex items-center justify-end">
-              <span className="text-xs text-white/25">{text.length} 字</span>
+              <span className="text-xs text-[#0d3b39]/55">{text.length} 字</span>
             </div>
-            {error && <p className="mt-3 rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</p>}
+            {error && <p className="mt-3 rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-600">{error}</p>}
             <div className="mt-5 flex gap-2">
-              <Button variant="ghost" onClick={onClose} className="flex-1 text-white/50 hover:bg-white/10 hover:text-white">取消</Button>
+              <Button variant="ghost" onClick={onClose} className="flex-1 text-[#0d3b39]/75 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]">取消</Button>
               <Button
                 onClick={analyze}
                 disabled={!text.trim() || analyzing}
-                className="flex-1 border-0 bg-white/10 text-white hover:bg-white/20 disabled:opacity-30"
+                className="flex-1 border-0 bg-[#0ABAB5]/[0.12] text-[#0d3b39] hover:bg-[#0ABAB5]/[0.22] disabled:opacity-30"
               >
                 {analyzing ? (
                   <>
@@ -2495,27 +2965,27 @@ function ImportChatModal({
         ) : (
           <>
             <h3 className="mb-1 text-lg font-semibold">识别结果</h3>
-            <p className="mb-4 text-xs text-white/40">确认无误后保存，信息都可以改</p>
+            <p className="mb-4 text-xs text-[#0d3b39]/65">确认无误后保存，信息都可以改</p>
 
             {/* 已存在的人：更新而非重复添加 */}
             {existing && (
               <div className="mb-3 flex items-center gap-2 rounded-xl border border-emerald-500/25 bg-emerald-500/[0.07] px-3 py-2">
-                <Check className="size-3.5 shrink-0 text-emerald-300" />
-                <p className="text-xs text-emerald-200/90">
+                <Check className="size-3.5 shrink-0 text-emerald-600" />
+                <p className="text-xs text-emerald-700/90">
                   人脉库里已有「{existing.name}」— 本次保存会<b>更新他的资料</b>（合并新信息、记录这次互动、刷新建议回复），不会重复添加
                 </p>
               </div>
             )}
 
             {/* 人脉预览 */}
-            <div className="rounded-xl border border-white/10 bg-white/[0.04] p-4">
+            <div className="rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] p-4">
               <div className="flex items-center gap-3">
-                <div className="flex size-11 items-center justify-center rounded-xl bg-indigo-500/20 text-lg font-semibold text-indigo-300">
+                <div className="flex size-11 items-center justify-center rounded-xl bg-[#0ABAB5]/15 text-lg font-semibold text-[#08948F]">
                   {result.person.name.charAt(0)}
                 </div>
                 <div className="min-w-0 flex-1">
                   <div className="text-base font-semibold">{result.person.name}</div>
-                  <div className="truncate text-xs text-white/40">
+                  <div className="truncate text-xs text-[#0d3b39]/65">
                     {[result.person.title, result.person.org].filter(Boolean).join(" · ") || "身份/组织未知"}
                   </div>
                 </div>
@@ -2530,14 +3000,14 @@ function ImportChatModal({
               {result.person.tags.length > 0 && (
                 <div className="mt-2.5 flex flex-wrap gap-1.5">
                   {result.person.tags.map((t) => (
-                    <span key={t} className="rounded bg-indigo-500/20 px-2 py-0.5 text-xs text-indigo-200">{t}</span>
+                    <span key={t} className="rounded bg-[#0ABAB5]/15 px-2 py-0.5 text-xs text-[#08948F]">{t}</span>
                   ))}
                 </div>
               )}
-              <div className="mt-3 space-y-1.5 text-xs leading-5 text-white/60">
-                {result.person.whatTheyDo && <p><span className="text-white/35">做什么：</span>{result.person.whatTheyDo}</p>}
-                {result.person.whatTheyWant && <p><span className="text-white/35">他想要：</span>{result.person.whatTheyWant}</p>}
-                <p><span className="text-white/35">判断依据：</span>{result.intent.evidence}</p>
+              <div className="mt-3 space-y-1.5 text-xs leading-5 text-[#0d3b39]/85">
+                {result.person.whatTheyDo && <p><span className="text-[#0d3b39]/65">做什么：</span>{result.person.whatTheyDo}</p>}
+                {result.person.whatTheyWant && <p><span className="text-[#0d3b39]/65">他想要：</span>{result.person.whatTheyWant}</p>}
+                <p><span className="text-[#0d3b39]/65">判断依据：</span>{result.intent.evidence}</p>
               </div>
             </div>
 
@@ -2545,11 +3015,11 @@ function ImportChatModal({
             {result.businessMatch?.matchedBusiness && (
               <div className="mt-3 rounded-xl border border-amber-500/25 bg-amber-500/[0.07] p-4">
                 <div className="flex items-center gap-2">
-                  <Sparkles className="size-3.5 text-amber-300" />
-                  <span className="text-xs font-medium text-amber-300">业务匹配 · {result.businessMatch.matchedBusiness}</span>
+                  <Sparkles className="size-3.5 text-amber-600" />
+                  <span className="text-xs font-medium text-amber-600">业务匹配 · {result.businessMatch.matchedBusiness}</span>
                 </div>
-                <p className="mt-1.5 text-xs leading-5 text-white/75">{result.businessMatch.suggestion}</p>
-                <p className="mt-1 text-[11px] text-amber-200/60">匹配理由：{result.businessMatch.reason}</p>
+                <p className="mt-1.5 text-xs leading-5 text-[#0d3b39]/75">{result.businessMatch.suggestion}</p>
+                <p className="mt-1 text-[11px] text-amber-700/60">匹配理由：{result.businessMatch.reason}</p>
               </div>
             )}
 
@@ -2557,42 +3027,42 @@ function ImportChatModal({
             {orgResearch && (
               <div className="mt-3 rounded-xl border border-violet-500/20 bg-violet-500/[0.06] p-4">
                 {orgResearch.status === "running" ? (
-                  <p className="flex items-center gap-2 text-xs text-violet-200/80">
+                  <p className="flex items-center gap-2 text-xs text-violet-700/80">
                     <span className="size-3 animate-spin rounded-full border-2 border-violet-300/30 border-t-violet-300" />
                     发现新组织「{orgResearch.orgName}」，正在联网检索资料…
                   </p>
                 ) : orgResearch.status === "done" && orgResearch.data?.found ? (
                   <>
                     <div className="flex items-center justify-between gap-2">
-                      <span className="text-xs font-medium text-violet-300">
+                      <span className="text-xs font-medium text-violet-600">
                         新组织「{orgResearch.orgName}」· 检索完成（保存时自动入库）
                       </span>
-                      <span className="shrink-0 rounded-full bg-violet-500/25 px-2 py-0.5 text-[10px] text-violet-200">
+                      <span className="shrink-0 rounded-full bg-violet-500/25 px-2 py-0.5 text-[10px] text-violet-700">
                         {orgResearch.data.category}
                       </span>
                     </div>
-                    <p className="mt-1.5 text-xs leading-5 text-white/70">{orgResearch.data.whatTheyDo}</p>
+                    <p className="mt-1.5 text-xs leading-5 text-[#0d3b39]/70">{orgResearch.data.whatTheyDo}</p>
                     {orgResearch.data.keyPoints.length > 0 && (
                       <ul className="mt-1.5 space-y-1">
                         {orgResearch.data.keyPoints.slice(0, 3).map((k, i) => (
-                          <li key={i} className="flex gap-1.5 text-[11px] leading-4 text-white/45">
-                            <span className="text-violet-300/60">·</span>{k}
+                          <li key={i} className="flex gap-1.5 text-[11px] leading-4 text-[#0d3b39]/70">
+                            <span className="text-violet-600/60">·</span>{k}
                           </li>
                         ))}
                       </ul>
                     )}
                     {orgResearch.data.businessMatch?.matchedBusiness && (
                       <div className="mt-2 rounded-lg bg-amber-500/10 px-2.5 py-1.5">
-                        <p className="text-[11px] text-amber-300">🎯 业务匹配：{orgResearch.data.businessMatch.matchedBusiness}</p>
-                        <p className="mt-0.5 text-[11px] text-white/60">{orgResearch.data.businessMatch.suggestion}</p>
+                        <p className="text-[11px] text-amber-600">🎯 业务匹配：{orgResearch.data.businessMatch.matchedBusiness}</p>
+                        <p className="mt-0.5 text-[11px] text-[#0d3b39]/85">{orgResearch.data.businessMatch.suggestion}</p>
                       </div>
                     )}
                     {orgResearch.data.cooperation && (
-                      <p className="mt-1.5 text-[11px] text-violet-200/70">合作切入：{orgResearch.data.cooperation}</p>
+                      <p className="mt-1.5 text-[11px] text-violet-700/70">合作切入：{orgResearch.data.cooperation}</p>
                     )}
                   </>
                 ) : (
-                  <p className="text-xs text-white/40">
+                  <p className="text-xs text-[#0d3b39]/65">
                     「{orgResearch.orgName}」是新组织，联网检索未找到可靠资料。保存时会先入组织库，资料以后手动补。
                   </p>
                 )}
@@ -2607,14 +3077,14 @@ function ImportChatModal({
                   onChange={(e) => setLinkUrl(e.target.value)}
                   onKeyDown={(e) => e.key === "Enter" && runLink()}
                   placeholder="有他的主页/文章/组织官网？贴链接补充上下文（可选）"
-                  className="flex-1 rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs outline-none placeholder-white/25 focus:border-white/20"
+                  className="flex-1 rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] px-3 py-2 text-xs outline-none placeholder-[#0d3b39]/55 focus:border-[#0ABAB5]/40"
                 />
                 <Button
                   size="sm"
                   variant="ghost"
                   onClick={runLink}
                   disabled={linkBusy || !linkUrl.trim()}
-                  className="h-8 shrink-0 px-2.5 text-xs text-white/50 hover:bg-white/10 hover:text-white disabled:opacity-30"
+                  className="h-8 shrink-0 px-2.5 text-xs text-[#0d3b39]/75 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39] disabled:opacity-30"
                 >
                   {linkBusy ? (
                     <span className="size-3 animate-spin rounded-full border-2 border-white/30 border-t-white" />
@@ -2624,15 +3094,15 @@ function ImportChatModal({
                   抓取
                 </Button>
               </div>
-              {linkError && <p className="mt-2 rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-300">{linkError}</p>}
+              {linkError && <p className="mt-2 rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-600">{linkError}</p>}
               {linkInfo && (
-                <div className="mt-2 rounded-xl border border-sky-500/20 bg-sky-500/[0.06] p-3">
-                  <p className="text-xs leading-5 text-white/75">{linkInfo.result.summary}</p>
+                <div className="mt-2 rounded-xl border border-[#08948F]/25 bg-[#08948F]/[0.06] p-3">
+                  <p className="text-xs leading-5 text-[#0d3b39]/75">{linkInfo.result.summary}</p>
                   {linkInfo.result.keyPoints.length > 0 && (
                     <ul className="mt-1.5 space-y-1">
                       {linkInfo.result.keyPoints.map((k, i) => (
-                        <li key={i} className="flex gap-1.5 text-[11px] leading-4 text-white/50">
-                          <span className="text-sky-300/60">·</span>
+                        <li key={i} className="flex gap-1.5 text-[11px] leading-4 text-[#0d3b39]/75">
+                          <span className="text-[#08948F]/60">·</span>
                           {k}
                         </li>
                       ))}
@@ -2640,11 +3110,11 @@ function ImportChatModal({
                   )}
                   {linkInfo.result.businessMatch?.matchedBusiness && (
                     <div className="mt-2 rounded-lg bg-amber-500/10 px-2.5 py-1.5">
-                      <p className="text-[11px] text-amber-300">🎯 业务匹配：{linkInfo.result.businessMatch.matchedBusiness}</p>
-                      <p className="mt-0.5 text-[11px] text-white/60">{linkInfo.result.businessMatch.suggestion}</p>
+                      <p className="text-[11px] text-amber-600">🎯 业务匹配：{linkInfo.result.businessMatch.matchedBusiness}</p>
+                      <p className="mt-0.5 text-[11px] text-[#0d3b39]/85">{linkInfo.result.businessMatch.suggestion}</p>
                     </div>
                   )}
-                  <p className="mt-1.5 text-[11px] text-sky-200/60">保存时自动并入资料</p>
+                  <p className="mt-1.5 text-[11px] text-[#08948F]/60">保存时自动并入资料</p>
                 </div>
               )}
             </div>
@@ -2652,23 +3122,23 @@ function ImportChatModal({
             {/* 建议回复 */}
             <div className="mt-3 rounded-xl border border-emerald-500/20 bg-emerald-500/[0.06] p-4">
               <div className="mb-1.5 flex items-center justify-between">
-                <span className="text-xs font-medium text-emerald-300">建议回复（保存后可在详情页复制）</span>
+                <span className="text-xs font-medium text-emerald-600">建议回复（保存后可在详情页复制）</span>
                 <button
                   onClick={() => { navigator.clipboard.writeText(result.ourMove.suggestedReply); setCopied(true); setTimeout(() => setCopied(false), 2000); }}
-                  className="flex items-center gap-1 text-xs text-white/40 hover:text-white"
+                  className="flex items-center gap-1 text-xs text-[#0d3b39]/65 hover:text-[#0d3b39]"
                 >
                   {copied ? <Check className="size-3" /> : <Copy className="size-3" />} 复制
                 </button>
               </div>
-              <p className="text-sm leading-6 text-white/80">{result.ourMove.suggestedReply}</p>
+              <p className="text-sm leading-6 text-[#0d3b39]/80">{result.ourMove.suggestedReply}</p>
               {result.ourMove.nextAction && (
-                <p className="mt-2 text-xs text-emerald-200/60">下一步：{result.ourMove.nextAction}</p>
+                <p className="mt-2 text-xs text-emerald-700/60">下一步：{result.ourMove.nextAction}</p>
               )}
             </div>
 
             <div className="mt-5 flex gap-2">
-              <Button variant="ghost" onClick={() => { setResult(null); setOrgResearch(null); }} className="text-white/50 hover:bg-white/10 hover:text-white">重新分析</Button>
-              <Button onClick={save} className="flex-1 border-0 bg-white/10 text-white hover:bg-white/20">
+              <Button variant="ghost" onClick={() => { setResult(null); setOrgResearch(null); }} className="text-[#0d3b39]/75 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]">重新分析</Button>
+              <Button onClick={save} className="flex-1 border-0 bg-[#0ABAB5]/[0.12] text-[#0d3b39] hover:bg-[#0ABAB5]/[0.22]">
                 <Check className="size-4" /> 保存到人脉库
               </Button>
             </div>
@@ -2681,13 +3151,13 @@ function ImportChatModal({
 
 // ─── 通用小组件 ───
 
-function PersonRow({ person: p, org, onSelect }: { person: Person; org?: Organization; onSelect: (id: string) => void }) {
+function PersonRow({ person: p, org, store, onSelect }: { person: Person; org?: Organization; store: NetworkStore; onSelect: (id: string) => void }) {
   const days = daysSince(p.lastContactDate);
   const orgColor = org ? CATEGORY_COLORS[org.category] : "#6366f1";
   return (
     <button
       onClick={() => onSelect(p.id)}
-      className="flex w-full items-center gap-3 rounded-xl border border-white/5 bg-white/[0.03] p-3 text-left backdrop-blur-xl transition-all hover:border-white/10 hover:bg-white/[0.06]"
+      className="flex w-full items-center gap-3 rounded-xl border border-[#0ABAB5]/15 bg-[#0ABAB5]/[0.04] p-3 text-left backdrop-blur-xl transition-all hover:border-[#0ABAB5]/25 hover:bg-[#0ABAB5]/[0.08]"
     >
       <div className="flex size-9 shrink-0 items-center justify-center rounded-lg text-sm font-semibold" style={{ backgroundColor: orgColor + "20", color: orgColor }}>
         {p.name.charAt(0)}
@@ -2695,15 +3165,16 @@ function PersonRow({ person: p, org, onSelect }: { person: Person; org?: Organiz
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
           <span className="truncate text-sm font-medium">{p.name}</span>
+          <Stars n={starsOf(p, store)} className="text-[11px]" />
           <span className="shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-medium" style={{ backgroundColor: STAGE_COLORS[p.stage] + "20", color: STAGE_COLORS[p.stage] }}>
             {p.stage}
           </span>
         </div>
-        <div className="mt-0.5 flex items-center gap-1.5 truncate text-xs text-white/40">
+        <div className="mt-0.5 flex items-center gap-1.5 truncate text-xs text-[#0d3b39]/65">
           {p.title && <span className="truncate">{p.title}</span>}
           {org && <span className="truncate">· {org.name}</span>}
           {days !== null && (
-            <span className={days > 30 ? "shrink-0 text-red-400/70" : days > 14 ? "shrink-0 text-amber-400/70" : "shrink-0"}>
+            <span className={days > 30 ? "shrink-0 text-red-600/70" : days > 14 ? "shrink-0 text-amber-600/70" : "shrink-0"}>
               · {days}天前
             </span>
           )}
@@ -2711,18 +3182,18 @@ function PersonRow({ person: p, org, onSelect }: { person: Person; org?: Organiz
         {p.tags.length > 0 && (
           <div className="mt-1 flex flex-wrap gap-1">
             {p.tags.slice(0, 4).map((t) => (
-              <span key={t} className="rounded bg-white/5 px-1.5 py-0.5 text-[10px] text-white/40">{t}</span>
+              <span key={t} className="rounded bg-[#0ABAB5]/[0.06] px-1.5 py-0.5 text-[10px] text-[#0d3b39]/65">{t}</span>
             ))}
           </div>
         )}
       </div>
-      <ChevronDown className="size-4 shrink-0 -rotate-90 text-white/20" />
+      <ChevronDown className="size-4 shrink-0 -rotate-90 text-[#0d3b39]/20" />
     </button>
   );
 }
 
 function ActionCard({
-  action, orgOf, onContact, onSnooze, onSelect, onCopy, copied,
+  action, orgOf, onContact, onSnooze, onSelect, onCopy, copied, onDealStatus, onRecordFeedback,
 }: {
   action: ActionItem;
   orgOf: (p: Person) => Organization | undefined;
@@ -2731,6 +3202,8 @@ function ActionCard({
   onSelect: (id: string) => void;
   onCopy: (p: Person) => void;
   copied: string | null;
+  onDealStatus?: (deal: Deal, status: DealStatus) => void;
+  onRecordFeedback?: (deal: Deal) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const p = action.person;
@@ -2738,10 +3211,11 @@ function ActionCard({
   const orgColor = org ? CATEGORY_COLORS[org.category] : "#6366f1";
 
   const urgencyStyles: Record<Urgency, string> = {
+    "deal-overdue": "border-orange-500/30 bg-orange-500/[0.07]",
     overdue: "border-red-500/20 bg-red-500/[0.05]",
     today: "border-amber-500/20 bg-amber-500/[0.05]",
-    soon: "border-white/5 bg-white/[0.03]",
-    suggested: "border-white/5 bg-white/[0.03]",
+    soon: "border-[#0ABAB5]/15 bg-[#0ABAB5]/[0.04]",
+    suggested: "border-[#0ABAB5]/15 bg-[#0ABAB5]/[0.04]",
   };
 
   return (
@@ -2753,33 +3227,50 @@ function ActionCard({
         <button onClick={() => onSelect(p.id)} className="min-w-0 flex-1 text-left">
           <div className="flex items-center gap-2">
             <span className="truncate text-sm font-medium">{p.name}</span>
+            <Stars n={action.stars} className="text-[11px]" />
             <span className="shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-medium" style={{ backgroundColor: STAGE_COLORS[p.stage] + "20", color: STAGE_COLORS[p.stage] }}>
               {p.stage}
             </span>
+            {action.urgency === "deal-overdue" && (
+              <span className="shrink-0 rounded-full bg-orange-500/20 px-1.5 py-0.5 text-[10px] text-orange-600">合作跟进</span>
+            )}
           </div>
-          <div className="mt-0.5 truncate text-xs text-white/40">
+          <div className="mt-0.5 truncate text-xs text-[#0d3b39]/65">
             {action.reason}
-            {p.title || org ? ` · ${[p.title, org?.name].filter(Boolean).join(" · ")}` : ""}
+            {action.urgency !== "deal-overdue" && (p.title || org) ? ` · ${[p.title, org?.name].filter(Boolean).join(" · ")}` : ""}
           </div>
         </button>
         <div className="flex shrink-0 gap-1">
-          <Button size="sm" variant="ghost" onClick={() => setExpanded(!expanded)} className="h-8 w-8 p-0 text-white/40 hover:bg-white/10 hover:text-white" title="展开话术">
+          <Button size="sm" variant="ghost" onClick={() => setExpanded(!expanded)} className="h-8 w-8 p-0 text-[#0d3b39]/65 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]" title="展开话术">
             {expanded ? <ChevronUp className="size-4" /> : <ChevronDown className="size-4" />}
           </Button>
-          <Button size="sm" variant="ghost" onClick={() => onContact(p)} className="h-8 w-8 p-0 text-white/50 hover:bg-white/10 hover:text-white" title="标记已联系">
+          <Button size="sm" variant="ghost" onClick={() => onContact(p)} className="h-8 w-8 p-0 text-[#0d3b39]/75 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]" title="标记已联系">
             <Check className="size-3.5" />
           </Button>
-          <Button size="sm" variant="ghost" onClick={() => onSnooze(p, 7)} className="h-8 px-2 text-white/50 hover:bg-white/10 hover:text-white">
+          <Button size="sm" variant="ghost" onClick={() => onSnooze(p, 7)} className="h-8 px-2 text-[#0d3b39]/75 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]">
             延后
           </Button>
         </div>
       </div>
+      {/* 合作事项快捷闭环：推进/达成/完结，回访任务可直接记录反馈 */}
+      {action.deal && onDealStatus && (
+        <div className="flex items-center gap-1.5 border-t border-[#0ABAB5]/15 px-3 py-2">
+          <span className="mr-1 text-[10px] text-[#0d3b39]/80">这笔合作：</span>
+          {action.deal.isFollowUpVisit && onRecordFeedback && (
+            <button onClick={() => onRecordFeedback(action.deal!)} className="rounded-lg bg-[#08948F]/15 px-2 py-1 text-[10px] text-[#08948F] transition-colors hover:bg-[#08948F]/25">📝 记录反馈</button>
+          )}
+          <button onClick={() => onDealStatus(action.deal!, "推进中")} className="rounded-lg bg-[#0ABAB5]/[0.06] px-2 py-1 text-[10px] text-[#0d3b39]/85 transition-colors hover:bg-[#0ABAB5]/[0.12]">再推 7 天</button>
+          <button onClick={() => onDealStatus(action.deal!, "达成")} className="rounded-lg bg-emerald-500/20 px-2 py-1 text-[10px] text-emerald-600 transition-colors hover:bg-emerald-500/30">🎉 达成了</button>
+          <button onClick={() => onDealStatus(action.deal!, "完结")} className="rounded-lg bg-[#0ABAB5]/[0.06] px-2 py-1 text-[10px] text-[#0d3b39]/85 transition-colors hover:bg-[#0ABAB5]/[0.12]">完结</button>
+          <button onClick={() => onDealStatus(action.deal!, "搁置")} className="rounded-lg bg-[#0ABAB5]/[0.06] px-2 py-1 text-[10px] text-[#0d3b39]/85 transition-colors hover:bg-[#0ABAB5]/[0.12]">搁置</button>
+        </div>
+      )}
       {expanded && (
-        <div className="border-t border-white/5 px-3 pb-3 pt-2">
-          <div className="rounded-lg bg-white/[0.04] p-3 text-xs leading-5 text-white/60">
+        <div className="border-t border-[#0ABAB5]/15 px-3 pb-3 pt-2">
+          <div className="rounded-lg bg-[#0ABAB5]/[0.06] p-3 text-xs leading-5 text-[#0d3b39]/85">
             {generateScript(p, org)}
           </div>
-          <Button size="sm" variant="ghost" onClick={() => onCopy(p)} className="mt-2 h-7 px-2 text-xs text-white/50 hover:bg-white/10 hover:text-white">
+          <Button size="sm" variant="ghost" onClick={() => onCopy(p)} className="mt-2 h-7 px-2 text-xs text-[#0d3b39]/75 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]">
             {copied === p.id ? <Check className="size-3" /> : <Copy className="size-3" />}
             <span className="ml-1">{copied === p.id ? "已复制" : "复制话术"}</span>
           </Button>
@@ -2794,7 +3285,7 @@ function FilterButton({ active, onClick, children }: { active: boolean; onClick:
     <button
       onClick={onClick}
       className={`flex items-center rounded-lg px-2.5 py-1.5 text-xs font-medium transition-all ${
-        active ? "bg-white/15 text-white" : "bg-white/5 text-white/40 hover:bg-white/10 hover:text-white/60"
+        active ? "bg-[#0ABAB5]/[0.16] text-[#0d3b39]" : "bg-[#0ABAB5]/[0.06] text-[#0d3b39]/85 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]/85"
       }`}
     >
       {children}
@@ -2811,12 +3302,12 @@ function EmptyState({
   action?: { label: string; onClick: () => void };
 }) {
   return (
-    <div className="flex flex-col items-center justify-center rounded-2xl border border-white/5 bg-white/[0.03] py-16 backdrop-blur-xl">
-      <Icon className="mb-3 size-8 text-white/20" />
-      <p className="text-sm text-white/40">{title}</p>
-      <p className="mt-1 max-w-xs text-center text-xs text-white/25">{hint}</p>
+    <div className="flex flex-col items-center justify-center rounded-2xl border border-[#0ABAB5]/15 bg-[#0ABAB5]/[0.04] py-16 backdrop-blur-xl">
+      <Icon className="mb-3 size-8 text-[#0d3b39]/20" />
+      <p className="text-sm text-[#0d3b39]/65">{title}</p>
+      <p className="mt-1 max-w-xs text-center text-xs text-[#0d3b39]/55">{hint}</p>
       {action && (
-        <Button size="sm" onClick={action.onClick} className="mt-4 border-0 bg-white/10 text-white hover:bg-white/20">
+        <Button size="sm" onClick={action.onClick} className="mt-4 border-0 bg-[#0ABAB5]/[0.12] text-[#0d3b39] hover:bg-[#0ABAB5]/[0.22]">
           <Plus className="size-3.5" /> {action.label}
         </Button>
       )}
@@ -2833,21 +3324,21 @@ function ImportHubModal({
   onOpen: (kind: "voice" | "ocr" | "chat" | "file" | "batch") => void;
 }) {
   const cards: Array<{ kind: "voice" | "ocr" | "chat" | "file" | "batch"; icon: React.ComponentType<{ className?: string }>; title: string; desc: string; badge?: string; accent: string; wide?: boolean }> = [
-    { kind: "voice", icon: Mic, title: "口述录入", desc: "按住说话就行：「今天见了XX公司的李总，想聊活动合作」——AI 自动建档、打标签、给合作建议", badge: "最快", accent: "text-fuchsia-300 bg-fuchsia-500/15", wide: true },
-    { kind: "ocr", icon: Camera, title: "截图识别", desc: "微信名片/资料页/聊天截图粘贴进来，本地 OCR，图片不上传", badge: "新", accent: "text-emerald-300 bg-emerald-500/15" },
-    { kind: "chat", icon: MessageCircle, title: "粘贴聊天记录", desc: "复制一段微信聊天，AI 提取人脉、意图、合作建议", accent: "text-indigo-300 bg-indigo-500/15" },
-    { kind: "file", icon: FileUp, title: "通讯录 / 名单表", desc: "Mac 通讯录 .vcf、飞书/Excel .csv 名单，一次导入一批", accent: "text-sky-300 bg-sky-500/15" },
-    { kind: "batch", icon: Users, title: "批量描述", desc: "每行一个人，AI 批量解析并判断录入价值", accent: "text-amber-300 bg-amber-500/15" },
+    { kind: "voice", icon: Mic, title: "口述录入", desc: "按住说话就行：「今天见了XX公司的李总，想聊活动合作」——AI 自动建档、打标签、给合作建议", badge: "最快", accent: "text-[#08948F] bg-[#0ABAB5]/12", wide: true },
+    { kind: "ocr", icon: Camera, title: "截图识别", desc: "微信名片/资料页/聊天截图粘贴进来，本地 OCR，图片不上传", badge: "新", accent: "text-emerald-600 bg-emerald-500/15" },
+    { kind: "chat", icon: MessageCircle, title: "粘贴聊天记录", desc: "复制一段微信聊天，AI 提取人脉、意图、合作建议", accent: "text-[#08948F] bg-[#0ABAB5]/12" },
+    { kind: "file", icon: FileUp, title: "通讯录 / 名单表", desc: "Mac 通讯录 .vcf、飞书/Excel .csv 名单，一次导入一批", accent: "text-[#08948F] bg-[#08948F]/12" },
+    { kind: "batch", icon: Users, title: "批量描述", desc: "每行一个人，AI 批量解析并判断录入价值", accent: "text-amber-600 bg-amber-500/15" },
   ];
   return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm" onClick={onClose}>
-      <div className="w-full max-w-lg rounded-2xl border border-white/10 bg-[#111116] p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-[#0d3b39]/60 p-4 backdrop-blur-sm" onClick={onClose}>
+      <div className="w-full max-w-lg rounded-2xl border border-[#0ABAB5]/25 bg-white p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-start justify-between">
           <div>
             <h3 className="text-lg font-semibold">快速导入人脉</h3>
-            <p className="mt-0.5 text-xs text-white/40">五种方式，识别后都可以改再保存</p>
+            <p className="mt-0.5 text-xs text-[#0d3b39]/65">五种方式，识别后都可以改再保存</p>
           </div>
-          <Button variant="ghost" size="icon" onClick={onClose} className="text-white/40 hover:bg-white/10 hover:text-white">
+          <Button variant="ghost" size="icon" onClick={onClose} className="text-[#0d3b39]/65 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]">
             <X className="size-5" />
           </Button>
         </div>
@@ -2856,20 +3347,20 @@ function ImportHubModal({
             <button
               key={c.kind}
               onClick={() => onOpen(c.kind)}
-              className={`group rounded-xl border border-white/10 bg-white/[0.03] p-4 text-left transition-all hover:border-white/20 hover:bg-white/[0.06] ${c.wide ? "col-span-2" : ""}`}
+              className={`group rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.04] p-4 text-left transition-all hover:border-[#0ABAB5]/40 hover:bg-[#0ABAB5]/[0.08] ${c.wide ? "col-span-2" : ""}`}
             >
               <div className="flex items-center justify-between">
                 <span className={`flex size-9 items-center justify-center rounded-lg ${c.accent}`}>
                   <c.icon className="size-4.5" />
                 </span>
-                {c.badge && <span className="rounded-full bg-fuchsia-500/20 px-1.5 py-0.5 text-[10px] text-fuchsia-300">{c.badge}</span>}
+                {c.badge && <span className="rounded-full bg-[#0ABAB5]/15 px-1.5 py-0.5 text-[10px] text-[#08948F]">{c.badge}</span>}
               </div>
               <p className="mt-2.5 text-sm font-medium">{c.title}</p>
-              <p className="mt-1 text-[11px] leading-4 text-white/35">{c.desc}</p>
+              <p className="mt-1 text-[11px] leading-4 text-[#0d3b39]/65">{c.desc}</p>
             </button>
           ))}
         </div>
-        <p className="mt-4 rounded-lg bg-white/[0.03] px-3 py-2 text-[11px] leading-4 text-white/30">
+        <p className="mt-4 rounded-lg bg-[#0ABAB5]/[0.04] px-3 py-2 text-[11px] leading-4 text-[#0d3b39]/60">
           自动化：微信新私聊自动分析入库（iLink 桥，扫码授权后免操作）；微信里 Cmd+C 复制聊天也会被后台 Agent 识别。
         </p>
       </div>
@@ -2890,6 +3381,20 @@ type CardParsed = {
   whatTheyDo: string | null;
   howMet?: string | null;
   cooperation: string | null;
+};
+
+// 人物联网检索结果（/api/network/research-person）
+type PersonResearch = {
+  found: boolean;
+  title: string | null;
+  background: string | null;
+  keyPoints: string[];
+  socialLinks: string[];
+  businessMatch: { matchedBusiness: string | null; reason: string; suggestion: string } | null;
+  cooperation: string | null;
+  confidence: number;
+  summary: string;
+  sources: string[];
 };
 
 function OcrImportModal({
@@ -3006,9 +3511,9 @@ function OcrImportModal({
   };
 
   return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm" onClick={onClose}>
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-[#0d3b39]/60 p-4 backdrop-blur-sm" onClick={onClose}>
       <div
-        className="max-h-[85vh] w-full max-w-md overflow-y-auto rounded-2xl border border-white/10 bg-[#111116] p-6 shadow-2xl"
+        className="max-h-[85vh] w-full max-w-md overflow-y-auto rounded-2xl border border-[#0ABAB5]/25 bg-white p-6 shadow-2xl"
         onClick={(e) => e.stopPropagation()}
         onPaste={(e) => {
           const f = Array.from(e.clipboardData.files).find((x) => x.type.startsWith("image/"));
@@ -3018,9 +3523,9 @@ function OcrImportModal({
         <div className="flex items-start justify-between">
           <div>
             <h3 className="text-lg font-semibold">截图识别导入</h3>
-            <p className="mt-0.5 text-xs text-white/40">在微信里截图（名片页/资料页/聊天），这里直接 ⌘V 粘贴</p>
+            <p className="mt-0.5 text-xs text-[#0d3b39]/65">在微信里截图（名片页/资料页/聊天），这里直接 ⌘V 粘贴</p>
           </div>
-          <Button variant="ghost" size="icon" onClick={onClose} className="text-white/40 hover:bg-white/10 hover:text-white">
+          <Button variant="ghost" size="icon" onClick={onClose} className="text-[#0d3b39]/65 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]">
             <X className="size-5" />
           </Button>
         </div>
@@ -3028,28 +3533,28 @@ function OcrImportModal({
         {/* 图片放置区 */}
         {!image && (
           <label
-            className="mt-4 flex cursor-pointer flex-col items-center justify-center rounded-xl border border-dashed border-white/15 bg-white/[0.02] py-10 transition-colors hover:border-emerald-400/40 hover:bg-emerald-500/[0.04]"
+            className="mt-4 flex cursor-pointer flex-col items-center justify-center rounded-xl border border-dashed border-[#0ABAB5]/30 bg-[#0ABAB5]/[0.03] py-10 transition-colors hover:border-emerald-400/40 hover:bg-emerald-500/[0.04]"
             onDragOver={(e) => e.preventDefault()}
             onDrop={(e) => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) loadFile(f); }}
           >
-            <Camera className="size-7 text-white/25" />
-            <p className="mt-2 text-sm text-white/50">粘贴、拖入截图，或点击选择</p>
-            <p className="mt-1 text-[11px] text-white/25">本地识别，图片不会上传</p>
+            <Camera className="size-7 text-[#0d3b39]/55" />
+            <p className="mt-2 text-sm text-[#0d3b39]/75">粘贴、拖入截图，或点击选择</p>
+            <p className="mt-1 text-[11px] text-[#0d3b39]/55">本地识别，图片不会上传</p>
             <input type="file" accept="image/png,image/jpeg,image/heic,image/webp" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) loadFile(f); }} />
           </label>
         )}
 
         {image && (
           <div className="mt-4">
-            <div className="relative overflow-hidden rounded-xl border border-white/10">
+            <div className="relative overflow-hidden rounded-xl border border-[#0ABAB5]/25">
               {/* eslint-disable-next-line @next/next/no-img-element */}
               <img src={image} alt="待识别截图" className="max-h-56 w-full object-contain" />
             </div>
             <div className="mt-2 flex items-center justify-between">
-              <button onClick={() => { setImage(null); setText(""); setCard(null); setMode(""); }} className="text-xs text-white/40 hover:text-white">
+              <button onClick={() => { setImage(null); setText(""); setCard(null); setMode(""); }} className="text-xs text-[#0d3b39]/65 hover:text-[#0d3b39]">
                 换一张
               </button>
-              <Button size="sm" onClick={() => runOcr()} disabled={ocrBusy} className="h-8 border-0 bg-emerald-500/25 px-3 text-xs text-emerald-100 hover:bg-emerald-500/40 disabled:opacity-40">
+              <Button size="sm" onClick={() => runOcr()} disabled={ocrBusy} className="h-8 border-0 bg-emerald-500/25 px-3 text-xs text-emerald-700 hover:bg-emerald-500/40 disabled:opacity-40">
                 {ocrBusy ? <span className="size-3 animate-spin rounded-full border-2 border-emerald-300/30 border-t-emerald-300" /> : <ScanText className="size-3.5" />}
                 {text ? "重新识别" : "识别文字"}
               </Button>
@@ -3057,23 +3562,23 @@ function OcrImportModal({
           </div>
         )}
 
-        {error && <p className="mt-3 rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</p>}
+        {error && <p className="mt-3 rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-600">{error}</p>}
 
         {/* OCR 结果：可修的文本 + 两种解析方式 */}
         {text && mode !== "card" && (
           <div className="mt-4">
-            <label className="text-xs font-medium text-white/40">识别结果（可修正错字）</label>
+            <label className="text-xs font-medium text-[#0d3b39]/65">识别结果（可修正错字）</label>
             <textarea
               value={text}
               onChange={(e) => setText(e.target.value)}
               rows={6}
-              className="mt-1 w-full resize-none rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none focus:border-white/20"
+              className="mt-1 w-full resize-none rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] px-3 py-2 text-sm outline-none focus:border-[#0ABAB5]/40"
             />
             <div className="mt-2 flex gap-2">
-              <Button size="sm" onClick={() => onChatText(text)} className="flex-1 border-0 bg-indigo-500/25 text-xs text-indigo-100 hover:bg-indigo-500/40">
+              <Button size="sm" onClick={() => onChatText(text)} className="flex-1 border-0 bg-[#0ABAB5]/20 text-xs text-[#08948F] hover:bg-#08948F/40">
                 <MessageCircle className="size-3.5" /> 按聊天记录分析
               </Button>
-              <Button size="sm" onClick={parseCard} disabled={cardBusy} className="flex-1 border-0 bg-white/10 text-xs text-white hover:bg-white/20 disabled:opacity-40">
+              <Button size="sm" onClick={parseCard} disabled={cardBusy} className="flex-1 border-0 bg-[#0ABAB5]/[0.12] text-xs text-[#0d3b39] hover:bg-[#0ABAB5]/[0.22] disabled:opacity-40">
                 {cardBusy ? <span className="size-3 animate-spin rounded-full border-2 border-white/30 border-t-white" /> : <Sparkles className="size-3.5" />}
                 按名片/资料解析
               </Button>
@@ -3094,7 +3599,7 @@ function OcrImportModal({
                 value={card.title ?? ""}
                 onChange={(e) => setCard({ ...card, title: e.target.value || null })}
                 placeholder="职位 / 身份"
-                className="mt-1 w-full bg-transparent text-sm text-white/60 outline-none placeholder-white/25"
+                className="mt-1 w-full bg-transparent text-sm text-[#0d3b39]/85 outline-none placeholder-[#0d3b39]/55"
               />
             </div>
             <div className="grid grid-cols-2 gap-2">
@@ -3102,30 +3607,30 @@ function OcrImportModal({
                 value={newOrgName}
                 onChange={(e) => setNewOrgName(e.target.value)}
                 placeholder={card.org ?? "组织（可改）"}
-                className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none placeholder-white/30 focus:border-white/20"
+                className="rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] px-3 py-2 text-sm outline-none placeholder-[#0d3b39]/60 focus:border-[#0ABAB5]/40"
               />
               <input
                 value={card.wechat ?? ""}
                 onChange={(e) => setCard({ ...card, wechat: e.target.value || null })}
                 placeholder="微信号"
-                className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none placeholder-white/30 focus:border-white/20"
+                className="rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] px-3 py-2 text-sm outline-none placeholder-[#0d3b39]/60 focus:border-[#0ABAB5]/40"
               />
             </div>
             <input
               value={card.city ?? ""}
               onChange={(e) => setCard({ ...card, city: e.target.value || null })}
               placeholder="城市"
-              className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none placeholder-white/30 focus:border-white/20"
+              className="w-full rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] px-3 py-2 text-sm outline-none placeholder-[#0d3b39]/60 focus:border-[#0ABAB5]/40"
             />
             {card.whatTheyDo && (
-              <p className="rounded-lg bg-white/[0.04] px-3 py-2 text-xs leading-5 text-white/50">{card.whatTheyDo}</p>
+              <p className="rounded-lg bg-[#0ABAB5]/[0.06] px-3 py-2 text-xs leading-5 text-[#0d3b39]/75">{card.whatTheyDo}</p>
             )}
             {card.cooperation && (
-              <p className="rounded-lg bg-emerald-500/[0.06] px-3 py-2 text-xs leading-5 text-emerald-200/70">🎯 {card.cooperation}</p>
+              <p className="rounded-lg bg-emerald-500/[0.06] px-3 py-2 text-xs leading-5 text-emerald-700/70">🎯 {card.cooperation}</p>
             )}
             <div className="flex gap-2 pt-1">
-              <Button variant="ghost" size="sm" onClick={() => setMode("")} className="flex-1 text-xs text-white/50 hover:bg-white/10 hover:text-white">返回修改文字</Button>
-              <Button size="sm" onClick={saveCard} disabled={!card.name.trim()} className="flex-1 border-0 bg-emerald-500/25 text-xs text-emerald-100 hover:bg-emerald-500/40 disabled:opacity-40">入库</Button>
+              <Button variant="ghost" size="sm" onClick={() => setMode("")} className="flex-1 text-xs text-[#0d3b39]/75 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]">返回修改文字</Button>
+              <Button size="sm" onClick={saveCard} disabled={!card.name.trim()} className="flex-1 border-0 bg-emerald-500/25 text-xs text-emerald-700 hover:bg-emerald-500/40 disabled:opacity-40">入库</Button>
             </div>
           </div>
         )}
@@ -3134,93 +3639,84 @@ function OcrImportModal({
   );
 }
 
-// ─── 口述录入：说话 → 语音转文字 → AI 建档 ───
-
-// Web Speech API 的最小类型（浏览器内置，TS 没有官方声明）
-type SpeechRecognitionAlternativeLike = { transcript: string };
-type SpeechRecognitionResultLike = { isFinal: boolean; length: number; 0: SpeechRecognitionAlternativeLike } & ArrayLike<SpeechRecognitionAlternativeLike>;
-type SpeechRecognitionResultListLike = { length: number } & ArrayLike<SpeechRecognitionResultLike>;
-type SpeechRecognitionEventLike = { resultIndex: number; results: SpeechRecognitionResultListLike };
-type SpeechRecognitionLike = {
-  lang: string;
-  continuous: boolean;
-  interimResults: boolean;
-  onresult: ((e: SpeechRecognitionEventLike) => void) | null;
-  onend: (() => void) | null;
-  onerror: ((e: { error?: string }) => void) | null;
-  start: () => void;
-  stop: () => void;
-};
-
-function getSpeechRecognition(): (new () => SpeechRecognitionLike) | null {
-  if (typeof window === "undefined") return null;
-  const w = window as unknown as { SpeechRecognition?: new () => SpeechRecognitionLike; webkitSpeechRecognition?: new () => SpeechRecognitionLike };
-  return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
-}
+// ─── 口述录入：录音 → 本地 whisper 识别 → AI 建档 ───
 
 function VoiceImportModal({
-  store, onClose, onChatText, onBatchText, onSave,
+  store, onClose, onChatText, onBatchText, onSave, onSaveMerged,
 }: {
   store: NetworkStore;
   onClose: () => void;
   onChatText: (text: string) => void;
   onBatchText: (text: string) => void;
   onSave: (p: Person, newOrg?: Organization) => void;
+  onSaveMerged?: (p: Person, interaction: Interaction, newOrg?: Organization) => void;
 }) {
-  const [listening, setListening] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const [transcribing, setTranscribing] = useState(false);
   const [transcript, setTranscript] = useState("");
-  const [interim, setInterim] = useState("");
   const [error, setError] = useState("");
-  const [supported, setSupported] = useState(true);
-  const recRef = useRef<SpeechRecognitionLike | null>(null);
-  const finalRef = useRef("");
+  const [elapsed, setElapsed] = useState(0);
+  const mediaRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const timerRef = useRef<number | null>(null);
 
   const [busy, setBusy] = useState(false);
   const [card, setCard] = useState<CardParsed | null>(null);
   const [newOrgName, setNewOrgName] = useState("");
+  // 人物联网检索：解析出「人名+组织」后自动跑，公开背景直接进档案
+  const [research, setResearch] = useState<PersonResearch | null>(null);
+  const [researchBusy, setResearchBusy] = useState(false);
 
-  const start = () => {
-    const Ctor = getSpeechRecognition();
-    if (!Ctor) { setSupported(false); setError("浏览器不支持语音识别。可以按 fn fn 两下用系统听写，直接打进下面的文本框"); return; }
+  const start = async () => {
     setError("");
-    finalRef.current = "";
     setTranscript("");
-    setInterim("");
     setCard(null);
-    const rec = new Ctor();
-    rec.lang = "zh-CN";
-    rec.continuous = true;
-    rec.interimResults = true;
-    rec.onresult = (e) => {
-      let final = "";
-      let temp = "";
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        const r = e.results[i];
-        if (r.isFinal) final += r[0].transcript;
-        else temp += r[0].transcript;
-      }
-      if (final) {
-        finalRef.current += final;
-        setTranscript(finalRef.current);
-      }
-      setInterim(temp);
-    };
-    rec.onend = () => setListening(false);
-    rec.onerror = (e) => {
-      const code = e.error ?? "unknown";
-      if (code === "not-allowed") setError("麦克风权限被拒绝：点地址栏🔒图标 → 麦克风 → 允许，或用系统听写（fn fn）打进文本框");
-      else if (code === "no-speech") { /* 没检测到语音，静默 */ }
-      else setError(`语音识别出错（${code}），可以改用系统听写（fn fn）打进文本框`);
-      setListening(false);
-    };
-    recRef.current = rec;
-    rec.start();
-    setListening(true);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const rec = new MediaRecorder(stream);
+      chunksRef.current = [];
+      rec.ondataavailable = (e) => { if (e.data.size) chunksRef.current.push(e.data); };
+      rec.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop());
+        if (timerRef.current) { window.clearInterval(timerRef.current); timerRef.current = null; }
+        setRecording(false);
+        setTranscribing(true);
+        try {
+          const blob = new Blob(chunksRef.current, { type: rec.mimeType || "audio/webm" });
+          if (blob.size < 3000) throw new Error("没录到声音，再试一次（点击后离麦克风近一点）");
+          const dataUrl = await new Promise<string>((resolve, reject) => {
+            const fr = new FileReader();
+            fr.onload = () => resolve(String(fr.result));
+            fr.onerror = () => reject(new Error("录音读取失败"));
+            fr.readAsDataURL(blob);
+          });
+          const r = await fetch("/api/network/stt", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ audio: dataUrl }),
+          });
+          const d = await r.json();
+          if (!r.ok) throw new Error(d.error ?? "识别失败");
+          setTranscript((prev) => (prev ? prev + "\n" : "") + (d.text as string));
+        } catch (e) {
+          setError(e instanceof Error ? e.message : "识别失败");
+        } finally {
+          setTranscribing(false);
+          setElapsed(0);
+        }
+      };
+      rec.start();
+      mediaRef.current = rec;
+      setRecording(true);
+      setElapsed(0);
+      timerRef.current = window.setInterval(() => setElapsed((v) => v + 1), 1000);
+    } catch {
+      setError("麦克风权限没开：点地址栏🔒图标 → 麦克风 → 允许，或直接在下面打字（支持 fn fn 系统听写）");
+    }
   };
 
   const stop = () => {
-    recRef.current?.stop();
-    setListening(false);
+    mediaRef.current?.stop();
   };
 
   // 单人解析（复用 ai-assist parse：一段口语描述 → 结构化字段）
@@ -3250,6 +3746,53 @@ function VoiceImportModal({
     }
   };
 
+  // 多人解析：同一段口述里有几个人
+  const parseMulti = async () => {
+    if (!transcript.trim()) return;
+    onBatchText(transcript);
+  };
+
+  // 查重：解析结果是否命中已有人脉（名字精确或互相包含）
+  const existingPerson = useMemo(() => {
+    if (!card?.name?.trim()) return null;
+    const n = card.name.trim();
+    return store.people.find((p) => p.name === n || (n.length >= 2 && p.name.includes(n)) || (p.name.length >= 2 && n.includes(p.name))) ?? null;
+  }, [card, store.people]);
+
+  // 人物背景自动检索：解析成功且能确定组织（或用户填了组织）就联网查一次
+  const runResearch = useCallback(async (personName: string, orgName: string) => {
+    if (!personName.trim() || researchBusy) return;
+    setResearchBusy(true);
+    setResearch(null);
+    try {
+      const r = await fetch("/api/network/research-person", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: personName.trim(),
+          org: orgName.trim() || null,
+          context: transcript.trim().slice(0, 400),
+        }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error ?? "检索失败");
+      const res = d.result as PersonResearch;
+      if (res?.found) setResearch(res);
+      else setResearch(null);
+    } catch {
+      setResearch(null); // 检索失败静默，不阻塞录入主流程
+    } finally {
+      setResearchBusy(false);
+    }
+  }, [researchBusy, transcript]);
+
+  // card 出现且有组织信息时自动触发（含用户新填的组织名）
+  useEffect(() => {
+    if (!card?.name?.trim() || research || researchBusy) return;
+    const orgName = (card.org ?? "").trim() || newOrgName.trim();
+    if (orgName) void runResearch(card.name.trim(), orgName);
+  }, [card, newOrgName, research, researchBusy, runResearch]);
+
   const saveCard = () => {
     if (!card?.name.trim()) return;
     const orgName = newOrgName.trim();
@@ -3265,18 +3808,63 @@ function VoiceImportModal({
       };
     }
     const today = localToday();
+
+    // ── 已有这个人 → 合并补充（空字段补上，非空保留旧值，追加互动记录）──
+    if (existingPerson) {
+      const researchNote = research
+        ? [`联网检索 · ${today}`, research.background ?? "", ...(research.keyPoints ?? []).map((k) => `· ${k}`), ...(research.socialLinks ?? []).length ? [`主页：${research.socialLinks.join("、")}`] : [], research.sources?.length ? `来源：${research.sources.join("、")}` : ""].filter(Boolean).join("\n")
+        : null;
+      const merged: Person = {
+        ...existingPerson,
+        orgId: existingPerson.orgId ?? newOrg?.id ?? org?.id,
+        title: existingPerson.title ?? card.title ?? research?.title ?? undefined,
+        tags: [...new Set([...existingPerson.tags, ...(card.tags ?? [])])],
+        wechat: existingPerson.wechat ?? card.wechat ?? undefined,
+        city: existingPerson.city ?? card.city ?? undefined,
+        whatTheyDo: existingPerson.whatTheyDo ?? card.whatTheyDo ?? undefined,
+        howMet: existingPerson.howMet ?? card.howMet ?? undefined,
+        cooperation: existingPerson.cooperation ?? card.cooperation ?? research?.cooperation ?? undefined,
+        notes: [
+          existingPerson.notes,
+          card.whatTheyDo ? `口述补充 · ${today}：${card.whatTheyDo}` : null,
+          researchNote,
+        ].filter(Boolean).join("\n\n"),
+        // 新信息说明关系有进展 → 阶段只升不降
+        stage: existingPerson.stage === "暂停" || existingPerson.stage === "深度合作" ? existingPerson.stage : "初步接触",
+        lastContactDate: today,
+        nextFollowUpDate: localDatePlus(today, existingPerson.stage === "深度合作" ? 14 : 14),
+        updatedAt: today,
+      };
+      const interaction: Interaction = {
+        id: `int-${Date.now()}`,
+        personId: existingPerson.id,
+        date: today,
+        channel: "其他",
+        summary: `口述更新：${card.whatTheyDo ?? card.cooperation ?? transcript.trim().slice(0, 80)}`,
+      };
+      onSaveMerged?.(merged, interaction, newOrg);
+      return;
+    }
+
+    // ── 新人 → 创建（联网检索到的背景一并写入）──
+    const researchNote = research
+      ? [`联网检索 · ${today}`, research.background ?? "", ...(research.keyPoints ?? []).map((k) => `· ${k}`), ...(research.socialLinks ?? []).length ? [`主页：${research.socialLinks.join("、")}`] : [], research.sources?.length ? `来源：${research.sources.join("、")}` : ""].filter(Boolean).join("\n")
+      : null;
     onSave({
       id: `p-${Date.now()}`,
       name: card.name.trim(),
       orgId: newOrg?.id ?? org?.id,
-      title: card.title ?? undefined,
+      title: card.title ?? research?.title ?? undefined,
       tags: card.tags ?? [],
       wechat: card.wechat ?? undefined,
       city: card.city ?? undefined,
       whatTheyDo: card.whatTheyDo ?? undefined,
       howMet: card.howMet ?? undefined,
-      cooperation: card.cooperation ?? undefined,
-      notes: `来源：口述录入 · ${transcript.trim().slice(0, 200)}`,
+      cooperation: card.cooperation ?? research?.cooperation ?? undefined,
+      notes: [
+        transcript.trim() ? `来源：口述录入 · ${transcript.trim().slice(0, 200)}` : "来源：口述录入",
+        researchNote,
+      ].filter(Boolean).join("\n\n"),
       stage: "初步接触",
       priority: "medium",
       createdAt: today,
@@ -3285,14 +3873,14 @@ function VoiceImportModal({
   };
 
   return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm" onClick={onClose}>
-      <div className="max-h-[85vh] w-full max-w-md overflow-y-auto rounded-2xl border border-white/10 bg-[#111116] p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-[#0d3b39]/60 p-4 backdrop-blur-sm" onClick={onClose}>
+      <div className="max-h-[85vh] w-full max-w-md overflow-y-auto rounded-2xl border border-[#0ABAB5]/25 bg-white p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-start justify-between">
           <div>
             <h3 className="text-lg font-semibold">口述录入</h3>
-            <p className="mt-0.5 text-xs text-white/40">像跟同事聊天一样说一句：「今天认识了个XX公司的李总，想做活动合作」</p>
+            <p className="mt-0.5 text-xs text-[#0d3b39]/65">像跟同事聊天一样说一句：「今天认识了个XX公司的李总，想做活动合作」</p>
           </div>
-          <Button variant="ghost" size="icon" onClick={onClose} className="text-white/40 hover:bg-white/10 hover:text-white">
+          <Button variant="ghost" size="icon" onClick={onClose} className="text-[#0d3b39]/65 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]">
             <X className="size-5" />
           </Button>
         </div>
@@ -3301,53 +3889,63 @@ function VoiceImportModal({
         {!card && (
           <div className="mt-5 flex flex-col items-center">
             <button
-              onClick={listening ? stop : start}
-              className={`flex size-20 items-center justify-center rounded-full transition-all ${listening ? "animate-pulse bg-red-500/30 text-red-200" : "bg-fuchsia-500/20 text-fuchsia-200 hover:bg-fuchsia-500/30"}`}
+              onClick={recording ? stop : start}
+              disabled={transcribing}
+              className={`flex size-20 items-center justify-center rounded-full transition-all ${recording ? "animate-pulse bg-red-500/30 text-red-200" : "bg-[#0ABAB5]/15 text-[#08948F] hover:bg-[#0ABAB5]/25"} disabled:opacity-40`}
             >
-              <Mic className="size-8" />
+              {transcribing ? (
+                <span className="size-7 animate-spin rounded-full border-2 border-[#0ABAB5]/40 border-t-#08948F" />
+              ) : (
+                <Mic className="size-8" />
+              )}
             </button>
-            <p className="mt-3 text-xs text-white/40">
-              {listening ? "正在听…（说完点一下停止）" : supported ? "点一下开始说" : "此浏览器不支持，请用系统听写（fn fn）打进下面的框"}
+            <p className="mt-3 text-xs text-[#0d3b39]/65">
+              {recording
+                ? `正在听… ${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, "0")}（说完点一下停止）`
+                : transcribing
+                  ? "本地识别中（几秒）…"
+                  : "点一下开始说 · 本地识别，录音不上传"}
             </p>
-            {(listening || interim) && (
-              <p className="mt-2 min-h-6 max-h-24 overflow-y-auto text-center text-sm leading-6 text-white/70">
-                {transcript} <span className="text-white/35">{interim}</span>
-              </p>
-            )}
+            {recording && <p className="mt-1 text-[10px] text-[#0d3b39]/70">可以长说，说完整段再点停止</p>}
           </div>
         )}
 
-        {error && <p className="mt-3 rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</p>}
+        {error && <p className="mt-3 rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-600">{error}</p>}
 
-        {/* 转写文本：可编辑 + 三种解析方式 */}
-        {!card && (transcript || !listening) && (
+        {/* 转写文本：可编辑 + 解析方式 */}
+        {!card && (transcript || !recording) && (
           <div className="mt-4">
             <textarea
               value={transcript}
               onChange={(e) => setTranscript(e.target.value)}
               rows={5}
-              placeholder="也可以直接打字（支持系统听写 fn fn）"
-              className="w-full resize-none rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm leading-6 outline-none placeholder-white/25 focus:border-white/20"
+              placeholder="说的话会出现在这里（也可直接打字，支持 fn fn 系统听写）"
+              className="w-full resize-none rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] px-3 py-2 text-sm leading-6 outline-none placeholder-[#0d3b39]/55 focus:border-[#0ABAB5]/40"
             />
             <div className="mt-2 flex gap-2">
-              <Button size="sm" onClick={parseSingle} disabled={!transcript.trim() || busy} className="flex-1 border-0 bg-fuchsia-500/25 text-xs text-fuchsia-100 hover:bg-fuchsia-500/40 disabled:opacity-40">
-                {busy ? <span className="size-3 animate-spin rounded-full border-2 border-fuchsia-300/30 border-t-fuchsia-300" /> : <Sparkles className="size-3.5" />}
+              <Button size="sm" onClick={parseSingle} disabled={!transcript.trim() || busy} className="flex-1 border-0 bg-[#0ABAB5]/20 text-xs text-[#08948F] hover:bg-[#0ABAB5]/35 disabled:opacity-40">
+                {busy ? <span className="size-3 animate-spin rounded-full border-2 border-[#0ABAB5]/40 border-t-#08948F" /> : <Sparkles className="size-3.5" />}
                 AI 建档（一个人）
               </Button>
-              <Button size="sm" variant="ghost" onClick={() => onBatchText(transcript)} disabled={!transcript.trim()} className="flex-1 text-xs text-white/50 hover:bg-white/10 hover:text-white disabled:opacity-40">
+              <Button size="sm" variant="ghost" onClick={parseMulti} disabled={!transcript.trim()} className="flex-1 text-xs text-[#0d3b39]/75 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39] disabled:opacity-40">
                 多个人
               </Button>
-              <Button size="sm" variant="ghost" onClick={() => onChatText(transcript)} disabled={!transcript.trim()} className="flex-1 text-xs text-white/50 hover:bg-white/10 hover:text-white disabled:opacity-40">
+              <Button size="sm" variant="ghost" onClick={() => onChatText(transcript)} disabled={!transcript.trim()} className="flex-1 text-xs text-[#0d3b39]/75 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39] disabled:opacity-40">
                 按聊天分析
               </Button>
             </div>
           </div>
         )}
 
-        {/* 解析结果：可编辑卡片 */}
+        {/* 解析结果：可编辑卡片（含已有人脉合并提示） */}
         {card && (
           <div className="mt-4 space-y-2.5">
-            <div className="rounded-xl border border-fuchsia-500/20 bg-fuchsia-500/[0.06] p-3">
+            {existingPerson && (
+              <p className="rounded-lg bg-emerald-500/15 px-3 py-2 text-xs text-emerald-700">
+                ↳ 库里已有「{existingPerson.name}」——保存时会把新信息合并进他（空缺字段补上、追加互动记录），不会重复建档
+              </p>
+            )}
+            <div className="rounded-xl border border-[#0ABAB5]/30 bg-[#0ABAB5]/[0.06] p-3">
               <input
                 value={card.name}
                 onChange={(e) => setCard({ ...card, name: e.target.value })}
@@ -3357,7 +3955,7 @@ function VoiceImportModal({
                 value={card.title ?? ""}
                 onChange={(e) => setCard({ ...card, title: e.target.value || null })}
                 placeholder="职位 / 身份"
-                className="mt-1 w-full bg-transparent text-sm text-white/60 outline-none placeholder-white/25"
+                className="mt-1 w-full bg-transparent text-sm text-[#0d3b39]/85 outline-none placeholder-[#0d3b39]/55"
               />
             </div>
             <div className="grid grid-cols-2 gap-2">
@@ -3365,29 +3963,53 @@ function VoiceImportModal({
                 value={newOrgName}
                 onChange={(e) => setNewOrgName(e.target.value)}
                 placeholder={card.org ?? "组织（可改）"}
-                className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none placeholder-white/30 focus:border-white/20"
+                className="rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] px-3 py-2 text-sm outline-none placeholder-[#0d3b39]/60 focus:border-[#0ABAB5]/40"
               />
               <input
                 value={card.city ?? ""}
                 onChange={(e) => setCard({ ...card, city: e.target.value || null })}
                 placeholder="城市"
-                className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm outline-none placeholder-white/30 focus:border-white/20"
+                className="rounded-xl border border-[#0ABAB5]/25 bg-[#0ABAB5]/[0.06] px-3 py-2 text-sm outline-none placeholder-[#0d3b39]/60 focus:border-[#0ABAB5]/40"
               />
             </div>
             {card.whatTheyDo && (
-              <p className="rounded-lg bg-white/[0.04] px-3 py-2 text-xs leading-5 text-white/50">{card.whatTheyDo}</p>
+              <p className="rounded-lg bg-[#0ABAB5]/[0.06] px-3 py-2 text-xs leading-5 text-[#0d3b39]/75">{card.whatTheyDo}</p>
+            )}
+            {/* 人物联网检索：进行中 / 结果 */}
+            {researchBusy && (
+              <p className="flex items-center gap-2 rounded-lg bg-[#08948F]/[0.08] px-3 py-2 text-xs text-[#08948F]/80">
+                <span className="size-3 animate-spin rounded-full border-2 border-#08948F/30 border-t-#08948F" />
+                正在联网检索「{card.name}」的公开背景…
+              </p>
+            )}
+            {research && !researchBusy && (
+              <div className="rounded-lg border border-[#08948F]/25 bg-[#08948F]/[0.06] p-3">
+                <p className="text-[11px] font-medium text-[#08948F]">🌐 联网补充 · {research.summary}</p>
+                {research.background && <p className="mt-1 text-xs leading-5 text-[#0d3b39]/80">{research.background}</p>}
+                {(research.keyPoints ?? []).length > 0 && (
+                  <div className="mt-1.5 space-y-0.5">
+                    {research.keyPoints.map((k, i) => <p key={i} className="text-[11px] leading-4 text-[#0d3b39]/65">· {k}</p>)}
+                  </div>
+                )}
+                {research.businessMatch?.matchedBusiness && (
+                  <p className="mt-1.5 text-[11px] text-emerald-600/80">🎯 {research.businessMatch.matchedBusiness}：{research.businessMatch.suggestion}</p>
+                )}
+                <p className="mt-1.5 text-[10px] text-[#0d3b39]/70">保存时自动写进档案备注</p>
+              </div>
             )}
             {card.cooperation && (
-              <p className="rounded-lg bg-fuchsia-500/[0.06] px-3 py-2 text-xs leading-5 text-fuchsia-200/70">🎯 合作建议：{card.cooperation}</p>
+              <p className="rounded-lg bg-[#0ABAB5]/[0.06] px-3 py-2 text-xs leading-5 text-[#08948F]/70">🎯 合作建议：{card.cooperation}</p>
             )}
             <div className="flex flex-wrap gap-1.5">
               {card.tags.map((t) => (
-                <span key={t} className="rounded-lg bg-fuchsia-500/15 px-2 py-1 text-xs text-fuchsia-200">{t}</span>
+                <span key={t} className="rounded-lg bg-[#0ABAB5]/12 px-2 py-1 text-xs text-[#08948F]">{t}</span>
               ))}
             </div>
             <div className="flex gap-2 pt-1">
-              <Button variant="ghost" size="sm" onClick={() => setCard(null)} className="flex-1 text-xs text-white/50 hover:bg-white/10 hover:text-white">重新说/改文字</Button>
-              <Button size="sm" onClick={saveCard} disabled={!card.name.trim()} className="flex-1 border-0 bg-fuchsia-500/25 text-xs text-fuchsia-100 hover:bg-fuchsia-500/40 disabled:opacity-40">入库</Button>
+              <Button variant="ghost" size="sm" onClick={() => setCard(null)} className="flex-1 text-xs text-[#0d3b39]/75 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]">重新说/改文字</Button>
+              <Button size="sm" onClick={saveCard} disabled={!card.name.trim()} className="flex-1 border-0 bg-[#0ABAB5]/20 text-xs text-[#08948F] hover:bg-[#0ABAB5]/35 disabled:opacity-40">
+                {existingPerson ? "合并到已有" : "入库"}
+              </Button>
             </div>
           </div>
         )}
@@ -3446,7 +4068,7 @@ function FileImportModal({
         const people = d.people as FileContact[];
         setItems(
           people
-            .filter((x) => x.name?.trim())
+            .filter((x) => x.name?.trim() && !isSelfName(x.name))
             .map((x) => {
               const exists = store.people.some((p) => p.name === x.name.trim());
               return { ...x, name: x.name.trim(), checked: !exists, exists };
@@ -3511,69 +4133,69 @@ function FileImportModal({
   const checkedCount = items.filter((x) => x.checked).length;
 
   return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm" onClick={onClose}>
-      <div className="max-h-[85vh] w-full max-w-md overflow-y-auto rounded-2xl border border-white/10 bg-[#111116] p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-[#0d3b39]/60 p-4 backdrop-blur-sm" onClick={onClose}>
+      <div className="max-h-[85vh] w-full max-w-md overflow-y-auto rounded-2xl border border-[#0ABAB5]/25 bg-white p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-start justify-between">
           <div>
             <h3 className="text-lg font-semibold">通讯录 / 名单表导入</h3>
-            <p className="mt-0.5 text-xs text-white/40">Mac 通讯录导出 .vcf · 飞书/Excel 导出 .csv · 文本 .txt</p>
+            <p className="mt-0.5 text-xs text-[#0d3b39]/65">Mac 通讯录导出 .vcf · 飞书/Excel 导出 .csv · 文本 .txt</p>
           </div>
-          <Button variant="ghost" size="icon" onClick={onClose} className="text-white/40 hover:bg-white/10 hover:text-white">
+          <Button variant="ghost" size="icon" onClick={onClose} className="text-[#0d3b39]/65 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]">
             <X className="size-5" />
           </Button>
         </div>
 
         {!items.length && !busy && (
           <label
-            className="mt-4 flex cursor-pointer flex-col items-center justify-center rounded-xl border border-dashed border-white/15 bg-white/[0.02] py-10 transition-colors hover:border-sky-400/40 hover:bg-sky-500/[0.04]"
+            className="mt-4 flex cursor-pointer flex-col items-center justify-center rounded-xl border border-dashed border-[#0ABAB5]/30 bg-[#0ABAB5]/[0.03] py-10 transition-colors hover:border-[#08948F]/50 hover:bg-#08948F/[0.04]"
             onDragOver={(e) => e.preventDefault()}
             onDrop={(e) => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) loadFile(f); }}
           >
             {busy ? (
-              <span className="size-6 animate-spin rounded-full border-2 border-sky-300/30 border-t-sky-300" />
+              <span className="size-6 animate-spin rounded-full border-2 border-#08948F/30 border-t-#08948F" />
             ) : (
-              <FileUp className="size-7 text-white/25" />
+              <FileUp className="size-7 text-[#0d3b39]/55" />
             )}
-            <p className="mt-2 text-sm text-white/50">{busy ? "解析中…" : "拖入文件，或点击选择"}</p>
-            <p className="mt-1 text-[11px] text-white/25">{fileName || "通讯录：全选联系人 → 导出 vCard"}</p>
+            <p className="mt-2 text-sm text-[#0d3b39]/75">{busy ? "解析中…" : "拖入文件，或点击选择"}</p>
+            <p className="mt-1 text-[11px] text-[#0d3b39]/55">{fileName || "通讯录：全选联系人 → 导出 vCard"}</p>
             <input type="file" accept=".vcf,.csv,.txt,.md" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) loadFile(f); }} />
           </label>
         )}
 
-        {error && <p className="mt-3 rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</p>}
+        {error && <p className="mt-3 rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-600">{error}</p>}
 
         {items.length > 0 && (
           <>
             <div className="mt-4 flex items-center justify-between">
-              <span className="text-xs text-white/40">{fileName} · {items.length} 人（勾选 {checkedCount}）</span>
-              <button onClick={() => setItems((prev) => prev.map((x) => ({ ...x, checked: !x.exists ? !prev.every((y) => y.checked) : x.checked })))} className="text-xs text-sky-300 hover:text-sky-200">
+              <span className="text-xs text-[#0d3b39]/65">{fileName} · {items.length} 人（勾选 {checkedCount}）</span>
+              <button onClick={() => setItems((prev) => prev.map((x) => ({ ...x, checked: !x.exists ? !prev.every((y) => y.checked) : x.checked })))} className="text-xs text-[#08948F] hover:text-[#08948F]">
                 全选/反选
               </button>
             </div>
             <div className="mt-2 max-h-72 space-y-1.5 overflow-y-auto">
               {items.map((x, i) => (
-                <label key={`${x.name}-${i}`} className={`flex cursor-pointer items-center gap-2.5 rounded-lg border px-3 py-2 transition-colors ${x.checked ? "border-sky-500/25 bg-sky-500/[0.06]" : "border-white/5 bg-white/[0.02]"}`}>
+                <label key={`${x.name}-${i}`} className={`flex cursor-pointer items-center gap-2.5 rounded-lg border px-3 py-2 transition-colors ${x.checked ? "border-[#08948F]/30 bg-[#08948F]/[0.06]" : "border-[#0ABAB5]/15 bg-[#0ABAB5]/[0.03]"}`}>
                   <input
                     type="checkbox"
                     checked={x.checked}
                     onChange={(e) => setItems((prev) => prev.map((y, j) => (j === i ? { ...y, checked: e.target.checked } : y)))}
-                    className="size-3.5 accent-sky-500"
+                    className="size-3.5 accent-#08948F"
                   />
                   <span className="min-w-0 flex-1">
                     <span className="flex items-center gap-1.5">
                       <span className="truncate text-sm">{x.name}</span>
-                      {x.exists && <span className="shrink-0 rounded-full bg-emerald-500/20 px-1.5 py-0.5 text-[10px] text-emerald-300">已存在</span>}
+                      {x.exists && <span className="shrink-0 rounded-full bg-emerald-500/20 px-1.5 py-0.5 text-[10px] text-emerald-600">已存在</span>}
                     </span>
                     {(x.org || x.title || x.wechat) && (
-                      <span className="mt-0.5 block truncate text-[11px] text-white/35">{[x.org, x.title, x.wechat, x.city].filter(Boolean).join(" · ")}</span>
+                      <span className="mt-0.5 block truncate text-[11px] text-[#0d3b39]/65">{[x.org, x.title, x.wechat, x.city].filter(Boolean).join(" · ")}</span>
                     )}
                   </span>
                 </label>
               ))}
             </div>
             <div className="mt-4 flex gap-2">
-              <Button variant="ghost" size="sm" onClick={onClose} className="flex-1 text-xs text-white/50 hover:bg-white/10 hover:text-white">取消</Button>
-              <Button size="sm" onClick={submit} disabled={!checkedCount} className="flex-1 border-0 bg-sky-500/25 text-xs text-sky-100 hover:bg-sky-500/40 disabled:opacity-40">
+              <Button variant="ghost" size="sm" onClick={onClose} className="flex-1 text-xs text-[#0d3b39]/75 hover:bg-[#0ABAB5]/[0.12] hover:text-[#0d3b39]">取消</Button>
+              <Button size="sm" onClick={submit} disabled={!checkedCount} className="flex-1 border-0 bg-[#08948F]/20 text-xs text-[#08948F] hover:bg-#08948F/40 disabled:opacity-40">
                 导入 {checkedCount} 人
               </Button>
             </div>

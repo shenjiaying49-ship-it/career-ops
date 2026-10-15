@@ -66,11 +66,14 @@ async function callOnce(
       choices?: Array<{ message?: { content?: string; reasoning_content?: string }; finish_reason?: string }>;
     };
     const choice = data.choices?.[0];
-    const content = choice?.message?.content;
-    if (!content) {
-      // 思考型模型会把 token 花在推理上导致 content 为空——提示换非思考型模型
+    let content = choice?.message?.content;
+    if (!content || !content.trim()) {
+      // 空返回两种情况：思考型模型 token 被推理吃光（带 reasoning_content），
+      // 或中转偶发空响应。都加大预算重试一次。
+      const retried = await retryWithBiggerBudget(system, user, opts);
+      if (retried && retried.trim()) return retried;
       if (choice?.message?.reasoning_content) {
-        throw new Error("模型只返回了推理内容没有答案（思考型模型 token 被吃掉），换 DEEPSEEK_MODEL=deepseek-v3.2 这类非思考型模型");
+        throw new Error("模型只返回了推理内容没有答案（已自动加大预算重试仍失败），换非思考型模型如 deepseek-v4-flash");
       }
       throw new Error("DeepSeek 返回为空");
     }
@@ -82,6 +85,40 @@ async function callOnce(
     throw err;
   } finally {
     clearTimeout(timer);
+  }
+}
+
+/** 思考型模型 token 不够时：推理 + 3x 预算重试一次 */
+async function retryWithBiggerBudget(
+  system: string,
+  user: string,
+  opts?: { maxTokens?: number; timeoutMs?: number },
+): Promise<string | null> {
+  const budget = (opts?.maxTokens ?? 2000) * 3 + 2000;
+  try {
+    const res = await fetch(`${BASE}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey()}`,
+      },
+      body: JSON.stringify({
+        model: process.env.DEEPSEEK_MODEL ?? "deepseek-chat",
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ],
+        response_format: { type: "json_object" },
+        max_tokens: budget,
+        stream: false,
+      }),
+      signal: AbortSignal.timeout(opts?.timeoutMs ?? 120_000),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+    return data.choices?.[0]?.message?.content ?? null;
+  } catch {
+    return null;
   }
 }
 

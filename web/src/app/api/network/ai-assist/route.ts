@@ -1,18 +1,23 @@
 import { deepseekJson } from "@/lib/network/deepseek";
 import { businessContextForPrompt } from "@/lib/network/business-profile";
+import { isSelfName } from "@/lib/network/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;
 
-// AI 人脉助手：三种模式
+// AI 人脉助手：多种模式
 // 1. parse   —— 一句话描述 → 结构化人脉字段（智能添加）
 // 2. suggest —— 已有人脉 → 补全 whatWeWant/cooperation/tags（详情页 AI 补全）
 // 3. script  —— 结合业务能力 + 历史互动 → 定制话术
 
+const SELF_RULE = "重要：操作者本人是「沈佳颖（Jocelyn/佳颖）」——她是用户自己，任何情况下都不要把她识别为要录入的联系人；描述里出现她时，分析的是对方那个人。";
+
 const SYSTEM_PREAMBLE = `你是生态合作 BD 的 AI 人脉助手。
 
 ${businessContextForPrompt()}
+
+${SELF_RULE}
 
 根据用户输入完成任务，输出严格合法的 JSON（数字必须是纯数字如 0.9，不要 ca./≈/~ 前缀）。`;
 
@@ -57,7 +62,7 @@ function extractJson(text: string): Parsed | null {
 }
 
 export async function POST(req: Request) {
-  let body: { kind?: string; text?: string; person?: Record<string, unknown>; org?: Record<string, unknown> | null; interactions?: Array<{ date: string; summary: string }>; missing?: string[] };
+  let body: { kind?: string; text?: string; person?: Record<string, unknown>; org?: Record<string, unknown> | null; interactions?: Array<{ date: string; summary: string }>; missing?: string[]; openDeals?: Array<{ id: string; title: string; nextStep?: string }> };
   try {
     body = await req.json();
   } catch {
@@ -71,6 +76,8 @@ export async function POST(req: Request) {
     if (!text) return Response.json({ error: "描述不能为空" }, { status: 400 });
     if (text.length > 2000) return Response.json({ error: "描述太长" }, { status: 400 });
     prompt = `任务：把用户对一个人脉的一句话描述解析成结构化字段。
+
+${SELF_RULE}
 
 描述：「${text}」
 
@@ -94,6 +101,8 @@ export async function POST(req: Request) {
     if (text.length > 3000) return Response.json({ error: "识别文本太长（名片/资料页截图即可）" }, { status: 400 });
     prompt = `任务：下面是一张截图经 OCR 识别出的文本（可能是微信个人资料页、名片、或一段简介）。把它解析成结构化人脉字段。OCR 可能有错别字，按上下文合理纠正。
 
+${SELF_RULE}
+
 识别文本：
 ${text}
 
@@ -116,6 +125,8 @@ ${text}
     if (!text) return Response.json({ error: "描述不能为空" }, { status: 400 });
     if (text.length > 10_000) return Response.json({ error: "内容太长（上限 1 万字符，约 100 人）" }, { status: 400 });
     prompt = `任务：用户粘贴了多行人脉描述（每行一个人）。把每一行解析成结构化字段，并判断每个人的录入价值。
+
+${SELF_RULE}
 
 描述：
 ${text}
@@ -189,6 +200,36 @@ ${text}
   "focus": "当前最该优先补齐的一条建议（一句话，指明为什么）"
 }
 规则：只针对空缺/模糊的信息问；结合他的身份、组织和我的业务能力（MCN 推广/线下活动直播/Token 服务/服务器租赁）定制；每题一句话说人话；已填清楚的不要重复问。`;
+  } else if (kind === "extract-deals") {
+    const text = (body.text ?? "").trim();
+    if (!text) return Response.json({ error: "内容不能为空" }, { status: 400 });
+    if (text.length > 8000) return Response.json({ error: "内容太长" }, { status: 400 });
+    const openDeals = Array.isArray(body.openDeals) ? (body.openDeals as Array<{ id: string; title: string; nextStep?: string }>) : [];
+    prompt = `任务：从这段与联系人的沟通内容里，提取「合作事项」的进展。用户是生态合作 BD，手上有多笔合作要推进到闭环。
+
+沟通内容：
+${text}
+
+当前这个人名下的未闭环合作：
+${openDeals.length ? openDeals.map((d) => `- id=${d.id} 「${d.title}」${d.nextStep ? `（下一步：${d.nextStep}）` : ""}`).join("\n") : "（无）"}
+
+输出 JSON：
+{
+  "deals": [
+    {
+      "matchId": "如果这段内容是对上面某个已有合作的新进展，填它的 id；新合作填 null",
+      "title": "合作一句话（新合作时必填；更新旧合作时可省略）",
+      "status": "推进中/达成/完结/搁置（这段内容暗示的状态；只是进展没有终局就'推进中'）",
+      "nextStep": "下一步动作（谁做什么，如'等我们发方案'/'周三拉群对接'）",
+      "followUpDays": 7
+    }
+  ]
+}
+规则：
+1. 内容里没提任何具体合作（只是寒暄/认识）→ deals 返回 []
+2. 提到"签约/合同定了/开始用/达成"→ 达成；明确说"不做了/搁置"→ 完结或搁置；其他进展 → 推进中
+3. followUpDays：推进中的按下一步紧迫度给 3-14；达成/完结的给 null（不再提醒）
+4. 最多 3 条，按重要性排；不要编造内容里没有的合作`;
   } else {
     return Response.json({ error: "未知任务类型" }, { status: 400 });
   }
@@ -205,5 +246,15 @@ ${text}
     return Response.json({ error: "AI 返回格式无法解析，重试一次", raw: raw.slice(0, 400) }, { status: 502 });
   }
   delete parsed.error;
+  // 服务端兜底：parse-batch 结果里滤掉操作者本人
+  if (kind === "parse-batch" && Array.isArray((parsed as { people?: unknown[] }).people)) {
+    (parsed as { people: unknown[] }).people = (parsed as { people: Array<{ name?: string }> }).people.filter(
+      (x) => x?.name && !isSelfName(x.name),
+    );
+  }
+  // parse / parse-card 直接识别成本人的 → 报错让前端拦住
+  if ((kind === "parse" || kind === "parse-card") && isSelfName((parsed as { name?: string }).name)) {
+    return Response.json({ error: "识别到的是你自己（沈佳颖），已拦截" }, { status: 422 });
+  }
   return Response.json({ result: parsed });
 }
